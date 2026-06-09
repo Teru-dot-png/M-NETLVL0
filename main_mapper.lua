@@ -2,7 +2,7 @@
     M-NET V2 | MAIN MAPPER NODE  --  Full Revision
     ===============================================
     Hardware  :  Advanced Computer
-                 Wireless Modem       -> Back  side
+                 Advanced Modem       -> Back  side  (cross-dimensional, infinite range)
                  Advanced Monitor     -> Top   side   (array supported)
 
     Protocol  :  MNET_V2

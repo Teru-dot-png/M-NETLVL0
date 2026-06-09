@@ -2,14 +2,13 @@
     M-NET V2 | SCOUT NODE
     ======================
     Role     : Dynamic edge node — geometry mapping, entity scanning,
-               heartbeat pulsing, relay deployment.
+               heartbeat pulsing.
     Hardware : CC:T Turtle with:
-                 - Wireless modem (any side)
+                 - Advanced Modem / Ender Modem (any side)
+                   Cross-dimensional, infinite range — no relays required.
                  - Advanced Peripherals Geo Scanner (left peripheral slot)
                  - Advanced Peripherals Entity Detector (right peripheral slot)
                  - Fuel in tank
-                 - Slot 16: spare computers (relay nodes) — optional
-                 - Disk drive + relay disk in inventory   — optional
     Protocol : MNET_V2
 
     LIFECYCLE:
@@ -28,8 +27,6 @@ local CFG = {
     SCAN_THROTTLE         = 0.5,  -- seconds between mapLoop iterations
     SCAN_RADIUS           = 8,    -- block radius for Geo Scanner
     FUEL_WARN_LEVEL       = 100,  -- fuel level that triggers a halt warning
-    RELAY_FAIL_THRESHOLD  = 3,    -- consecutive send failures before relay deploy
-    RELAY_SLOT            = 16,   -- inventory slot holding spare computers
 }
 
 -- ============================================================
@@ -38,7 +35,6 @@ local CFG = {
 local server_id   = nil
 local local_hwid  = nil
 local authorized  = false
-local fail_count  = 0    -- consecutive transmission failures
 
 -- Peripheral handles (resolved after modem open)
 local scanner = nil  -- geoScanner
@@ -58,7 +54,7 @@ end
 -- ============================================================
 local function init()
     if not peripheral.find("modem", rednet.open) then
-        error("[FATAL] No wireless modem found. Attach one and reboot.")
+        error("[FATAL] No Advanced Modem found. Attach one and reboot.")
     end
 
     -- Advanced Peripherals peripherals — non-fatal if absent
@@ -142,59 +138,6 @@ local function scanEntities()
 end
 
 -- ============================================================
--- RELAY DEPLOYMENT
--- ============================================================
---[[
-    Relay deployment strategy:
-      1. The turtle carries pre-loaded relay computers in slot CFG.RELAY_SLOT.
-         Each relay computer already has relay_startup.lua installed as startup.lua.
-      2. When signal degrades (consecutive send failures), the turtle places
-         one relay computer on the ground behind it and boots it.
-      3. The relay computer runs autonomously from that point.
-
-    Alternative disk-drive injection (advanced):
-      If you carry a disk drive + floppy with relay_startup.lua, use a
-      disk drive placed adjacent to the new computer and let it autorun.
-      See relay_startup.lua for the script that must be on the floppy.
-]]
-local function deployRelay()
-    print("[RELAY]  Signal degraded — deploying relay node...")
-
-    -- Check inventory slot for a spare computer
-    turtle.select(CFG.RELAY_SLOT)
-    local item = turtle.getItemDetail()
-
-    if not item or not item.name:find("computer") then
-        print("[RELAY]  No computer found in slot " .. CFG.RELAY_SLOT .. ". Skipping deployment.")
-        turtle.select(1)
-        return
-    end
-
-    -- Turn around, place relay computer behind the turtle
-    turtle.turnLeft()
-    turtle.turnLeft()
-
-    if turtle.place() then
-        print("[RELAY]  Relay computer placed. Booting...")
-        -- Attempt to power it on via the peripheral side-channel
-        local relay_pc = peripheral.wrap("front")
-        if relay_pc and relay_pc.turnOn then
-            relay_pc.turnOn()
-            print("[RELAY]  Relay node online. Resuming operation.")
-        else
-            print("[RELAY]  Could not auto-boot relay. Turn it on manually.")
-        end
-    else
-        print("[RELAY]  Could not place relay computer (slot blocked?).")
-    end
-
-    -- Face forward again
-    turtle.turnLeft()
-    turtle.turnLeft()
-    turtle.select(1)
-end
-
--- ============================================================
 -- STATE: REQ_AUTH → ACK_AUTH
 -- ============================================================
 local function performHandshake()
@@ -247,15 +190,8 @@ local function pulseLoop()
         }
 
         local ok = pcall(rednet.send, server_id, pulse, "MNET_V2")
-
         if not ok then
-            fail_count = fail_count + 1
-            print(string.format(
-                "[PULSE]  Heartbeat send failed. Consecutive failures: %d",
-                fail_count
-            ))
-        else
-            fail_count = 0
+            print("[PULSE]  Heartbeat send failed.")
         end
 
         os.sleep(CFG.HEARTBEAT_INTERVAL)
@@ -292,13 +228,7 @@ local function mapLoop()
             end
         end
 
-        -- ── 3. Relay deployment check ────────────────────────
-        if fail_count >= CFG.RELAY_FAIL_THRESHOLD then
-            deployRelay()
-            fail_count = 0
-        end
-
-        -- ── 4. Geo scan ──────────────────────────────────────
+        -- ── 3. Geo scan ──────────────────────────────────────
         local scan_data = {}
         if scanner then
             local ok, result = pcall(scanner.scan, CFG.SCAN_RADIUS)
@@ -307,13 +237,13 @@ local function mapLoop()
             end
         end
 
-        -- ── 5. Entity scan ───────────────────────────────────
+        -- ── 4. Entity scan ───────────────────────────────────
         local threat_found, threat_info = scanEntities()
 
-        -- ── 6. Position update ───────────────────────────────
+        -- ── 5. Position update ───────────────────────────────
         local pos = getPosition()
 
-        -- ── 7. Construct Payload C (GEO_DATA + Threats) ──────
+        -- ── 6. Construct Payload C (GEO_DATA + Threats) ──────
         local payload = {
             type            = "GEO_DATA",
             hwid            = local_hwid,
@@ -324,14 +254,10 @@ local function mapLoop()
             threat_data     = threat_info,
         }
 
-        -- ── 8. Transmit to Main Mapper ────────────────────────
-        local ok, err = pcall(rednet.send, server_id, payload, "MNET_V2")
+        -- ── 7. Transmit to Main Mapper ────────────────────────
+        local ok = pcall(rednet.send, server_id, payload, "MNET_V2")
         if not ok then
-            fail_count = fail_count + 1
-            print(string.format(
-                "[MAP]   Telemetry send failed. Consecutive failures: %d",
-                fail_count
-            ))
+            print("[MAP]   Telemetry send failed.")
         end
 
         os.sleep(CFG.SCAN_THROTTLE)
