@@ -1,0 +1,13 @@
+# Byte-compiled / optimized / DLL files (if any tools generate them)
+*.luac
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor directories
+.vscode/
+.idea/
+
+# Logs
+*.log
