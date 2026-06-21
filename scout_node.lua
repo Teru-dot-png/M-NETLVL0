@@ -123,6 +123,7 @@ DIRV = {
 -- but called from navigation code that comes first.
 local scanAround
 local gpsSyncPos
+local getMovePriority
 
 -- ============================================================
 -- HELPERS
@@ -2160,7 +2161,7 @@ local STATE_FN = {
 
 -- O-NET V1: returns this turtle's current move priority.
 -- Lower = higher urgency. Used by the push protocol.
-local function getMovePriority()
+function getMovePriority()
     return MOVE_PRIORITY[current_state] or 10
 end
 
