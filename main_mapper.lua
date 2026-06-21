@@ -75,6 +75,7 @@ local zone_log      = {}     -- zone_log[hwid] = { dir, offset, exhausted }
 local lane_counters = {      -- how many lanes assigned per direction
     [0]=0,[1]=0,[2]=0,[3]=0
 }
+local fleet
 local park_claim_by_hwid = {}
 local park_claim_by_key  = {}
 
@@ -243,7 +244,7 @@ end
 -- STATE
 -- ============================================================
 -- fleet[hwid] = { net_id, last_pulse, pos, status, dir, fuel, free }
-local fleet      = {}
+fleet      = {}
 local dir_index  = 0
 local fleet_slot = 0    -- increments per turtle enlisted, used for park slot assignment
 local ore_log    = {}
