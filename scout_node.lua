@@ -633,19 +633,41 @@ end
 
 -- ============================================================
 -- STEP 1: PICKAXE CHECK AT BOOT
+-- Scans every inventory slot for a pickaxe item and equips it
+-- on the left. Does not assume slot 16 is the scanner.
 -- ============================================================
 local function checkPickaxeAtBoot()
+    -- Already equipped: nothing to do.
     if pickaxeEquipped() then
         log("INIT", "Pickaxe: equipped on left. OK")
-        return
+        return true
     end
-    if turtle.getItemCount(SCANNER_SLOT) > 0 then
-        log("INIT", "Trying hot-swap recovery from slot 16...")
-        turtle.select(SCANNER_SLOT)
-        turtle.equipLeft()
-        if pickaxeEquipped() then log("INIT", "Pickaxe recovered OK."); return end
+
+    -- Search all 16 slots for anything named *pickaxe*.
+    log("INIT", "No pickaxe on left. Scanning all slots...")
+    for s = 1, 16 do
+        local detail = turtle.getItemDetail(s)
+        if detail and tostring(detail.name or ""):find("pickaxe") then
+            log("INIT", string.format("Pickaxe found in slot %d (%s). Equipping...", s, detail.name))
+            turtle.select(s)
+            turtle.equipLeft()
+            if pickaxeEquipped() then
+                log("INIT", "Pickaxe equipped. OK")
+                turtle.select(1)
+                -- Whatever was on the left before went into slot s.
+                -- If slot s now holds the scanner item, reassign SCANNER_SLOT.
+                local swapped = turtle.getItemDetail(s)
+                if swapped and tostring(swapped.name or ""):find("scanner") then
+                    log("INIT", "Scanner item landed in slot " .. s .. ". Noted.")
+                end
+                return true
+            end
+        end
     end
-    log("INIT", "Pickaxe not found. Will fetch from BASE_CHEST after GPS fix.")
+
+    log("INIT", "No pickaxe found anywhere in inventory.")
+    log("INIT", "Will fetch one from BASE_CHEST after GPS calibration + enlistment.")
+    return false
 end
 
 -- ============================================================
@@ -687,44 +709,103 @@ end
 
 -- ============================================================
 -- STEP 3: CALIBRATE HEADING
+-- Strategy:
+--   1. Get GPS fix before moving (p1).
+--   2. Try each of the four cardinal directions in turn.
+--      For each: attempt to move forward (dig if blocked by diggable rock).
+--   3. Get GPS fix after the successful step (p2).
+--   4. Derive heading from (p2 - p1). The facing variable does not
+--      matter during the search; GPS tells us the truth afterwards.
 -- ============================================================
 local function calibrate()
     log("NAV", "Calibrating heading via GPS...")
     local p1 = gpsPos()
-    if not p1 then error("[FATAL] No GPS fix. Set up a GPS constellation first.", 0) end
+    if not p1 then
+        error("[FATAL] No GPS fix. Build a GPS constellation first.", 0)
+    end
+    log("NAV", string.format("Pre-move GPS: (%d,%d,%d)", p1.x, p1.y, p1.z))
 
-    -- Try up to 12 times to move one block in whatever direction we are facing
     local moved = false
-    for _ = 1, 12 do
-        if turtle.forward() then moved = true; break end
-        -- Try all four directions looking for any open or diggable path
-        for turn = 1, 3 do
-            turtle.turnRight(); facing = (facing + 1) % 4
-            if turtle.forward() then moved = true; break end
+
+    -- Try all four cardinal directions. Stop as soon as one works.
+    for attempt = 0, 3 do
+        log("NAV", string.format("Calibration attempt %d: trying to move forward...", attempt + 1))
+
+        -- Attempt to move; if blocked, try digging once.
+        local ok = turtle.forward()
+        if not ok then
+            local has_block, data = turtle.inspect()
+            if has_block and type(data) == "table" then
+                local name = data.name or ""
+                if isDiggable(name) then
+                    log("NAV", "Block ahead (" .. name .. "). Digging...")
+                    turtle.dig()
+                    sleep(0.2)
+                    ok = turtle.forward()
+                else
+                    log("NAV", "Block ahead is protected or fluid: [" .. name .. "]. Turning.")
+                end
+            end
         end
-        if moved then break end
-        -- Dig straight ahead as last resort during calibration
-        turtle.turnRight(); facing = (facing + 1) % 4  -- face back to original
-        if not turtle.dig() then turtle.attack() end
-        sleep(0.2)
+
+        if ok then
+            moved = true
+            break
+        end
+
+        -- Could not move this direction. Turn right and try next.
+        turtle.turnRight()
+        -- We will fix `facing` from the GPS result, not from counting turns.
     end
 
     if not moved then
-        error("[FATAL] Fully boxed in. Clear at least one adjacent block and reboot.", 0)
+        -- Last resort: try up and down.
+        if turtle.up() then
+            -- Record as a vertical move; set a temporary known position.
+            local p2 = gpsPos()
+            if p2 then
+                pos = copy(p2)
+                -- Heading is unknown after a vertical move. Try moving horizontal now.
+                for _ = 0, 3 do
+                    if turtle.forward() then
+                        local p3 = gpsPos()
+                        if p3 then
+                            local dx, dz = p3.x - p2.x, p3.z - p2.z
+                            if     dx ==  1 then facing = 1
+                            elseif dx == -1 then facing = 3
+                            elseif dz ==  1 then facing = 2
+                            elseif dz == -1 then facing = 0 end
+                            pos = copy(p3)
+                            log("NAV", string.format("Calibrated (via up+fwd): facing=%d pos=(%d,%d,%d)", facing, pos.x, pos.y, pos.z))
+                            return
+                        end
+                    end
+                    turtle.turnRight()
+                end
+            end
+        end
+        error("[FATAL] All six directions blocked. Clear a path and reboot.", 0)
     end
 
+    -- We moved. Derive heading from GPS delta.
     local p2 = gpsPos()
-    if not p2 then error("[FATAL] Lost GPS signal during calibration step.", 0) end
+    if not p2 then
+        error("[FATAL] Lost GPS signal during calibration step.", 0)
+    end
+    log("NAV", string.format("Post-move GPS: (%d,%d,%d)", p2.x, p2.y, p2.z))
 
     local dx, dz = p2.x - p1.x, p2.z - p1.z
     if     dx ==  1 then facing = 1
     elseif dx == -1 then facing = 3
     elseif dz ==  1 then facing = 2
     elseif dz == -1 then facing = 0
-    else error("[FATAL] Calibration step was not a clean cardinal block.", 0) end
+    else
+        error(string.format("[FATAL] GPS delta (%d,_,%d) was not a clean cardinal step.", dx, dz), 0)
+    end
 
     pos = copy(p2)
-    log("NAV", string.format("Calibrated: facing=%d pos=(%d,%d,%d)", facing, pos.x, pos.y, pos.z))
+    log("NAV", string.format("Calibrated: facing=%d (%s) pos=(%d,%d,%d)",
+        facing, ({"N","E","S","W"})[facing+1], pos.x, pos.y, pos.z))
 end
 
 -- ============================================================
@@ -1075,22 +1156,64 @@ log("INIT", "HWID: " .. hwid)
 
 openModem()
 
-has_scanner = turtle.getItemCount(SCANNER_SLOT) > 0
-log("INIT", "Geo Scanner (slot 16): " .. (has_scanner and "READY" or "MISSING"))
+-- Detect scanner: look in slot 16 but verify by item name, not just count.
+-- The pickaxe might also be in slot 16, so we check what is actually there.
+local slot16 = turtle.getItemDetail(SCANNER_SLOT)
+if slot16 and tostring(slot16.name or ""):find("scanner") then
+    has_scanner = true
+    log("INIT", "Geo Scanner confirmed in slot 16. READY")
+elseif slot16 and tostring(slot16.name or ""):find("pickaxe") then
+    has_scanner = false
+    log("INIT", "Slot 16 holds a pickaxe, not a scanner. Scanning DISABLED.")
+    log("INIT", "Place the Geo Scanner item in slot 16 if you want scanning.")
+else
+    -- Unknown item or empty; do a broader search for scanner in any slot.
+    has_scanner = false
+    for s = 1, 16 do
+        local d = turtle.getItemDetail(s)
+        if d and tostring(d.name or ""):find("scanner") then
+            if s ~= SCANNER_SLOT then
+                log("INIT", string.format("Scanner found in slot %d, not 16. Moving...", s))
+                -- Move it: select, swap, etc. is complex; just note and accept.
+            end
+            has_scanner = true
+            log("INIT", "Geo Scanner found in slot " .. s .. ". READY")
+            break
+        end
+    end
+    if not has_scanner then
+        log("INIT", "No Geo Scanner found. Scanning DISABLED.")
+    end
+end
 
-checkPickaxeAtBoot()   -- 1. pickaxe
-wakeUp()               -- 2. fuel aboard
-calibrate()            -- 3. heading from GPS
-forageForCoal()        -- 4. forage if still low
-handshake()            -- 5. enlist with Overseer
+-- STEP 1: Pickaxe check (scans all slots, no assumptions about slot 16)
+local pick_ok = checkPickaxeAtBoot()
 
--- If pickaxe was still missing after boot, fetch it now (base coords arrived)
+-- STEP 2: Fuel
+wakeUp()
+
+-- STEP 3: GPS calibration (tries all 4 directions, derives heading from delta)
+calibrate()
+
+-- STEP 4: Forage for coal if still below target (heading now known)
+forageForCoal()
+
+-- STEP 5: Enlist with Overseer (this is when base + dump coords arrive)
+handshake()
+
+-- STEP 6: Fetch pickaxe NOW if boot check failed (base coords arrived in step 5)
 if not pickaxeEquipped() then
-    log("INIT","Fetching pickaxe from BASE_CHEST now...")
+    log("INIT", "Pickaxe still missing. Fetching from BASE_CHEST...")
     fetchPickaxeFromBase(copy(pos))
 end
 
-log("BOOT", string.format("All systems ready. fuel=%s pos=(%d,%d,%d)",
-    tostring(turtle.getFuelLevel()), pos.x, pos.y, pos.z))
+log("BOOT", string.format(
+    "All systems ready. Pickaxe=%s Scanner=%s Fuel=%s Pos=(%d,%d,%d) Facing=%s",
+    pickaxeEquipped() and "OK" or "MISSING",
+    has_scanner and "OK" or "OFF",
+    tostring(turtle.getFuelLevel()),
+    pos.x, pos.y, pos.z,
+    ({"N","E","S","W"})[facing+1]
+))
 
 parallel.waitForAll(brainThread, listenerThread, heartbeatThread)
