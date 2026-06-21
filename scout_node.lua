@@ -1,18 +1,6 @@
 --[[
-    M-NET V3 | MINER NODE  (Phase 1 hardened)
+    M-NET V3 | MINER NODE 
     ==========================================
-    Phase 1 changes:
-        - detectHardware() scans all 16 slots by exact item name
-          before touching anything. Finds advancedperipherals:geo_scanner
-          and diamond_pickaxe regardless of which slot they are in.
-          Modem side auto-detected. No assumptions anywhere.
-        - Calibration persists to disk (mnet_cal.cfg). On reboot inside
-          a tunnel the saved heading + pos are restored if GPS confirms
-          the position matches. The one-step calibration move is skipped.
-        - All three threads (brain, listener, heartbeat) run inside
-          pcall restart loops. An internal crash logs the full error and
-          restarts the thread after 2 seconds. parallel.waitForAll never
-          exits to terminal again.
 
     Boot order:
         1. detectHardware()  -- find everything, touch nothing
