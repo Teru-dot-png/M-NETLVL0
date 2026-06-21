@@ -199,9 +199,13 @@ local function liveInspect()
     end
     local dx = DIRV[facing].dx
     local dz = DIRV[facing].dz
-    store(turtle.inspect(),     pos.x+dx, pos.y,   pos.z+dz)
-    store(turtle.inspectUp(),   pos.x,    pos.y+1, pos.z)
-    store(turtle.inspectDown(), pos.x,    pos.y-1, pos.z)
+    -- Capture both return values explicitly so they do not bleed into nx/ny/nz.
+    local ok_f, dat_f = turtle.inspect()
+    local ok_u, dat_u = turtle.inspectUp()
+    local ok_d, dat_d = turtle.inspectDown()
+    store(ok_f, dat_f, pos.x+dx, pos.y,   pos.z+dz)
+    store(ok_u, dat_u, pos.x,    pos.y+1, pos.z)
+    store(ok_d, dat_d, pos.x,    pos.y-1, pos.z)
 end
 
 -- ============================================================
