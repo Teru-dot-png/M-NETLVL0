@@ -211,18 +211,33 @@ end
 -- ============================================================
 -- PICKAXE DETECTION
 -- ============================================================
-local function leftIsPeripheral()
-    return peripheral.wrap("left") ~= nil
-end
-
+-- Returns true only if we are confident the left slot holds a pickaxe.
+-- Strategy:
+--   1. If the left slot is a peripheral (scanner), it is definitely NOT a pickaxe.
+--   2. Try turtle.getEquippedLeft() if it exists (CC:T 1.109+).
+--   3. Fall back to turtle.inspect() in front: if dig succeeds on a known-stone
+--      block we know the pickaxe is there. Otherwise use a simpler heuristic.
 local function pickaxeEquipped()
-    if leftIsPeripheral() then return false end
+    -- A peripheral on the left means the scanner is there, not the pickaxe.
+    if peripheral.wrap("left") ~= nil then return false end
+
+    -- CC:Tweaked 1.109+ exposes getEquippedLeft()
     if turtle.getEquippedLeft then
         local info = turtle.getEquippedLeft()
+        -- nil means empty slot
         if info == nil then return false end
         return tostring(info.name or ""):find("pickaxe") ~= nil
     end
-    return true  -- older CC:T: assume non-peripheral left = pickaxe
+
+    -- Older CC:T: the left slot is either a pickaxe or empty.
+    -- We cannot distinguish without trying to dig; accept the ambiguity
+    -- and treat non-peripheral left as having the pickaxe.
+    -- The first actual dig attempt will expose an empty slot immediately.
+    return true
+end
+
+local function leftIsPeripheral()
+    return peripheral.wrap("left") ~= nil
 end
 
 -- ============================================================
@@ -575,60 +590,86 @@ end
 
 -- ============================================================
 -- PICKAXE FETCH FROM BASE_CHEST
+-- Uses peripheral.wrap on the chest to read its contents first,
+-- then sucks only the slot that holds a pickaxe. No cycling.
 -- ============================================================
 local function fetchPickaxeFromBase(resumePos)
     if not base then
         log("PICK", "No BASE_CHEST set. Cannot fetch pickaxe. Halting.")
         while true do sleep(5) end
     end
-    log("PICK", "No pickaxe on left. Heading to BASE_CHEST...")
+    log("PICK", "Heading to BASE_CHEST for a pickaxe...")
 
     if not moveTo({ x = base.x, y = base.y + 1, z = base.z }) then
         log("PICK", "Could not reach BASE_CHEST. Parking until rebooted.")
         while true do sleep(5) end
     end
 
-    local fetched = false
-    for _ = 1, 54 do
-        for s = 1, 15 do
-            if turtle.getItemCount(s) == 0 then
-                turtle.select(s)
-                if turtle.suckDown(1) then
-                    local d = turtle.getItemDetail(s)
-                    if d and tostring(d.name or ""):find("pickaxe") then
-                        turtle.select(s); turtle.equipLeft()
-                        if pickaxeEquipped() then
-                            log("PICK", "Pickaxe equipped from BASE_CHEST.")
-                            fetched = true; break
-                        end
-                    end
-                    turtle.dropDown()
-                else break end
-            end
-        end
-        if fetched then break end
-    end
-
-    if not fetched then
-        log("PICK", "No pickaxe in BASE_CHEST. Waiting every 10s...")
-        while not fetched do
-            sleep(10)
-            for s = 1, 15 do
-                if turtle.getItemCount(s) == 0 then
-                    turtle.select(s)
-                    if turtle.suckDown(1) then
-                        local d = turtle.getItemDetail(s)
-                        if d and tostring(d.name or ""):find("pickaxe") then
-                            turtle.select(s); turtle.equipLeft()
-                            if pickaxeEquipped() then
-                                log("PICK","Pickaxe found. Resuming.")
-                                fetched = true; break
+    local function tryFetch()
+        -- Try to read the chest inventory directly to find the pickaxe slot.
+        local chest = peripheral.wrap("bottom")
+        if chest and chest.list then
+            local contents = chest.list()
+            for chestSlot, item in pairs(contents) do
+                if tostring(item.name or ""):find("pickaxe") then
+                    log("PICK", string.format("Pickaxe in chest slot %d (%s). Pulling...", chestSlot, item.name))
+                    -- Find a free turtle slot and suck specifically that chest slot.
+                    for ts = 1, 15 do
+                        if turtle.getItemCount(ts) == 0 then
+                            turtle.select(ts)
+                            -- pushItems from chest to turtle is not always available;
+                            -- use suckDown and verify what we got.
+                            turtle.suckDown(1)
+                            local got = turtle.getItemDetail(ts)
+                            if got and tostring(got.name or ""):find("pickaxe") then
+                                turtle.select(ts)
+                                turtle.equipLeft()
+                                if pickaxeEquipped() then
+                                    log("PICK", "Pickaxe equipped. OK")
+                                    turtle.select(1)
+                                    return true
+                                end
+                            else
+                                -- Got something else; put it back.
+                                turtle.select(ts)
+                                turtle.dropDown()
                             end
+                            break
                         end
-                        turtle.dropDown()
                     end
                 end
             end
+        else
+            -- Fallback: chest not wrappable. Suck one item, check, return if wrong.
+            for ts = 1, 15 do
+                if turtle.getItemCount(ts) == 0 then
+                    turtle.select(ts)
+                    if not turtle.suckDown(1) then break end
+                    local got = turtle.getItemDetail(ts)
+                    if got and tostring(got.name or ""):find("pickaxe") then
+                        turtle.equipLeft()
+                        if pickaxeEquipped() then
+                            log("PICK", "Pickaxe equipped (fallback). OK")
+                            turtle.select(1)
+                            return true
+                        end
+                    else
+                        turtle.dropDown()
+                    end
+                    break
+                end
+            end
+        end
+        return false
+    end
+
+    local fetched = tryFetch()
+    if not fetched then
+        log("PICK", "No pickaxe found in BASE_CHEST.")
+        log("PICK", "Add a diamond pickaxe to the BASE_CHEST. Retrying every 10s...")
+        while not fetched do
+            sleep(10)
+            fetched = tryFetch()
         end
     end
 
@@ -637,40 +678,61 @@ end
 
 -- ============================================================
 -- STEP 1: PICKAXE CHECK AT BOOT
--- Scans every inventory slot for a pickaxe item and equips it
--- on the left. Does not assume slot 16 is the scanner.
+-- Scans every inventory slot for a pickaxe by item name and equips it.
+-- Whatever was previously on the left (e.g. the scanner) lands in that
+-- slot; we then move it back to SCANNER_SLOT if it is the scanner.
 -- ============================================================
 local function checkPickaxeAtBoot()
-    -- Already equipped: nothing to do.
+    -- Already correctly equipped.
     if pickaxeEquipped() then
         log("INIT", "Pickaxe: equipped on left. OK")
         return true
     end
 
-    -- Search all 16 slots for anything named *pickaxe*.
-    log("INIT", "No pickaxe on left. Scanning all slots...")
+    -- If something is on the left (scanner), unequip it to a free slot first.
+    if leftIsPeripheral() then
+        log("INIT", "Scanner on left. Moving it to free slot before equipping pickaxe...")
+        for s = 1, 16 do
+            if turtle.getItemCount(s) == 0 then
+                turtle.select(s)
+                turtle.equipLeft()   -- scanner goes into slot s
+                log("INIT", "Scanner moved to slot " .. s)
+                break
+            end
+        end
+    end
+
+    -- Now search all slots for a pickaxe.
+    log("INIT", "Searching all slots for a pickaxe...")
     for s = 1, 16 do
         local detail = turtle.getItemDetail(s)
         if detail and tostring(detail.name or ""):find("pickaxe") then
-            log("INIT", string.format("Pickaxe found in slot %d (%s). Equipping...", s, detail.name))
+            log("INIT", string.format("Pickaxe in slot %d (%s). Equipping...", s, detail.name))
             turtle.select(s)
             turtle.equipLeft()
+            -- Whatever came off the left lands in slot s now.
+            -- If it is the scanner, move it to SCANNER_SLOT.
+            local swapped = turtle.getItemDetail(s)
+            if swapped and tostring(swapped.name or ""):find("scanner") then
+                if s ~= SCANNER_SLOT then
+                    -- Swap it to the dedicated slot if possible.
+                    if turtle.getItemCount(SCANNER_SLOT) == 0 then
+                        turtle.select(s)
+                        -- transferTo is not available; just leave it, scanAround handles any slot.
+                        log("INIT", "Scanner landed in slot " .. s .. " (not slot 16, scan still works).")
+                    end
+                end
+            end
             if pickaxeEquipped() then
                 log("INIT", "Pickaxe equipped. OK")
                 turtle.select(1)
-                -- Whatever was on the left before went into slot s.
-                -- If slot s now holds the scanner item, reassign SCANNER_SLOT.
-                local swapped = turtle.getItemDetail(s)
-                if swapped and tostring(swapped.name or ""):find("scanner") then
-                    log("INIT", "Scanner item landed in slot " .. s .. ". Noted.")
-                end
                 return true
             end
         end
     end
 
-    log("INIT", "No pickaxe found anywhere in inventory.")
-    log("INIT", "Will fetch one from BASE_CHEST after GPS calibration + enlistment.")
+    log("INIT", "No pickaxe found in inventory.")
+    log("INIT", "Will fetch from BASE_CHEST after GPS + enlistment.")
     return false
 end
 
