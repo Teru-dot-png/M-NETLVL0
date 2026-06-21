@@ -8,37 +8,39 @@
         Advanced Monitor : any side or array (the live cockpit display)
         Supply chest     : adjacent optional (for the warehouse readout)
 
-    Screens:
-        MONITOR  : three-panel cockpit — fleet roster (left), voxel map
-                   (centre), ore haul + supplies (right). Refreshes every
-                   0.5 s. Live ore feed cycles in the bottom row.
-        TERMINAL : command input and log. Type  help  for all commands.
-
     Phase 4  Lane assignment: spreads turtles across parallel tunnels
              spaced LANE_SPACING (4) blocks apart. Tracks exhausted zones.
              Commands: zones, newrun <hwid>
 
-    Phase 5  Map persistence: voxel database saved to mnet_map.dat,
-             auto-loaded at boot, auto-saved every 60 s.
+    Phase 5  Map persistence: voxel database saved to mnet_map.dat in
+             compact tab-separated format (x\ty\tz\tname per line).
+             Only ores, air corridors, hazards, and protected blocks are
+             stored. Stone is never stored (navigator assumes solid anyway).
+             Auto-loaded at boot, auto-saved every 60 s.
              Ore cluster detection: nearby reports merge into one GOTO
              dispatched to the nearest idle turtle.
              Live ore feed: bottom cockpit row cycles through last 8 finds.
              Commands: savemap, clearmap, feed
 
-    Post-launch fixes:
-        - handleGeoData now accepts air blocks so dug tunnels clear on the
-          map in real time. Previously all isAir() entries were skipped,
-          leaving stone where open corridors existed.
-        - Terminal thread fixed: orphaned map output removed from newrun
-          block, missing "help" elseif added, feed block end corrected.
-        - ORE_FEED, clusters, and related constants moved to file-scope
-          STATE block so renderFooter can see them before they are declared.
+    Post-launch additions:
+        - setpark x1 y1 z1 x2 y2 z2: defines a parking rectangle.
+          Each turtle is assigned a unique slot; on PARKED it navigates
+          there and waits neatly instead of stopping wherever it finished.
+        - getme <ore> <count>: scans the map for known ore positions,
+          dispatches GOTOs to nearest idle turtles, tracks completion via
+          ORE_MINED messages and dump chest count. No-map warning prints
+          once only, not every 3 seconds.
+        - handleGeoData accepts air blocks, clearing dug tunnels on the
+          map in real time.
+        - shouldStore + setVoxel skip all stone-class blocks entirely,
+          keeping RAM and disk usage proportional to useful data only.
+        - Terminal thread fully fixed: all commands present and working,
+          no orphaned code blocks, help command wired correctly.
 
     Setup:
-        Type  setdump x y z  to set the loot drop chest.
-        Type  setbase x y z  to set the emergency coal + pickaxe chest.
-        (Look at each chest, press F3, read "Targeted Block".)
-        Coords save to disk and push live to the fleet.
+        setdump x y z    loot drop chest
+        setbase x y z    emergency coal + pickaxe chest
+        setpark x1 y1 z1 x2 y2 z2   parking rectangle
         Type  help  for the full command list.
 ]]
 
@@ -46,8 +48,13 @@
 -- CONFIGURATION
 -- ============================================================
 local PROTOCOL   = "MNET_V3"
-local DUMP_CHEST = { x = 0, y = 64, z = 0 }   -- mined loot is emptied here
-local BASE_CHEST = { x = 0, y = 64, z = 2 }   -- emergency coal + spare pickaxes
+local DUMP_CHEST = { x = 0, y = 64, z = 0 }
+local BASE_CHEST = { x = 0, y = 64, z = 2 }
+
+-- Parking zone: axis-aligned rectangle defined by two corners.
+-- Turtles assigned a slot inside this zone when they park.
+-- nil = no zone set, turtles park in place.
+local PARK_ZONE  = nil   -- { x1,y1,z1, x2,y2,z2 } or nil
 
 local WANT_LIST = {                            -- ores worth a detour
     diamond = true, ancient_debris = true, emerald = true,
@@ -66,6 +73,24 @@ local zone_log      = {}     -- zone_log[hwid] = { dir, offset, exhausted }
 local lane_counters = {      -- how many lanes assigned per direction
     [0]=0,[1]=0,[2]=0,[3]=0
 }
+
+-- Returns the park position for a given fleet slot index (0-based).
+-- Fills the rectangle row by row along the longest horizontal axis.
+local function getParkSlot(slot_index)
+    if not PARK_ZONE then return nil end
+    local x1 = math.min(PARK_ZONE.x1, PARK_ZONE.x2)
+    local x2 = math.max(PARK_ZONE.x1, PARK_ZONE.x2)
+    local y  = math.min(PARK_ZONE.y1, PARK_ZONE.y2)
+    local z1 = math.min(PARK_ZONE.z1, PARK_ZONE.z2)
+    local z2 = math.max(PARK_ZONE.z1, PARK_ZONE.z2)
+    local cols = x2 - x1 + 1
+    local rows = z2 - z1 + 1
+    local total = cols * rows
+    local idx   = slot_index % total
+    local col   = idx % cols
+    local row   = math.floor(idx / cols)
+    return { x = x1 + col, y = y, z = z1 + row }
+end
 
 local function assignLane(hwid)
     -- Prefer a direction that has fewer turtles to spread the fleet out
@@ -108,7 +133,10 @@ local CONFIG_FILE = "mnet_overseer.cfg"
 local function saveConfig()
     local f = fs.open(CONFIG_FILE, "w")
     if f then
-        f.write(textutils.serialize({ dump = DUMP_CHEST, base = BASE_CHEST, want = WANT_LIST }))
+        f.write(textutils.serialize({
+            dump = DUMP_CHEST, base = BASE_CHEST,
+            want = WANT_LIST,  park = PARK_ZONE,
+        }))
         f.close()
     end
 end
@@ -123,11 +151,15 @@ local function loadConfig()
         if data.dump then DUMP_CHEST = data.dump end
         if data.base then BASE_CHEST = data.base end
         if data.want then WANT_LIST  = data.want end
+        if data.park then PARK_ZONE  = data.park end
     end
 end
 
 local function broadcastConfig()
-    rednet.broadcast({ type = "CONFIG", dump = DUMP_CHEST, base = BASE_CHEST }, PROTOCOL)
+    rednet.broadcast({
+        type = "CONFIG", dump = DUMP_CHEST,
+        base = BASE_CHEST, park = PARK_ZONE,
+    }, PROTOCOL)
 end
 
 -- ============================================================
@@ -136,6 +168,7 @@ end
 -- fleet[hwid] = { net_id, last_pulse, pos, status, dir, fuel, free }
 local fleet      = {}
 local dir_index  = 0
+local fleet_slot = 0    -- increments per turtle enlisted, used for park slot assignment
 local ore_log    = {}
 local dispatched = {}
 
@@ -830,7 +863,11 @@ local function handleAuth(net_id, msg)
         lane_offset = offset,
         fuel        = "?",
         free        = "?",
+        park_slot   = fleet_slot,
     }
+    fleet_slot = fleet_slot + 1
+
+    local park_pos = getParkSlot(fleet[msg.hwid].park_slot)
 
     rednet.send(net_id, {
         type        = "AUTH_ACK",
@@ -839,9 +876,13 @@ local function handleAuth(net_id, msg)
         lane_offset = offset,
         dump        = DUMP_CHEST,
         base        = BASE_CHEST,
+        park        = park_pos,
     }, PROTOCOL)
 
-    print(string.format("[ENLIST] %s  ->  dir=%d lane=+%d", msg.hwid, dir, offset))
+    print(string.format("[ENLIST] %s  ->  dir=%d lane=+%d park=%s",
+        msg.hwid, dir, offset,
+        park_pos and string.format("(%d,%d,%d)", park_pos.x, park_pos.y, park_pos.z)
+                 or "none"))
 end
 
 local function handleHeartbeat(msg)
@@ -1064,7 +1105,7 @@ end
 -- ============================================================
 -- ORDER THREAD  (drives getme commands)
 -- Runs a background loop. Every 3 seconds for each active order:
---   1. Count items already in the dump chest (already collected).
+--   1. Count items already in the dump chest.
 --   2. Scan the voxel map for known ore locations.
 --   3. Sort nearest-first and dispatch GOTO to idle turtles.
 --   4. Mark order complete when target is reached.
@@ -1075,8 +1116,7 @@ local function orderThread()
 
         for ore_name, order in pairs(active_orders) do
 
-            -- Count what is already in the dump chest
-            local in_chest = countInDump(ore_name)
+            local in_chest  = countInDump(ore_name)
             local effective = math.max(order.got, in_chest)
 
             if effective >= order.target then
@@ -1088,14 +1128,10 @@ local function orderThread()
                 local remaining = order.target - effective
                 local pending   = 0
                 for _ in pairs(order.jobs) do pending = pending + 1 end
-
-                -- How many more jobs can we dispatch right now?
                 local slots_open = remaining - pending
-                if slots_open > 0 then
-                    -- Find the centroid of the fleet as our distance reference
-                    local refpos = view_cx and { x=view_cx, y=view_y, z=view_cz }
-                                            or  { x=0, y=0, z=0 }
 
+                if slots_open > 0 then
+                    local refpos    = { x=view_cx, y=view_y, z=view_cz }
                     local locations = findOreInMap(ore_name, refpos)
                     local dispatched_this_tick = 0
 
@@ -1103,7 +1139,6 @@ local function orderThread()
                         if dispatched_this_tick >= slots_open then break end
                         local lk = loc.x..":"..loc.y..":"..loc.z
                         if not order.jobs[lk] then
-                            -- Find nearest idle turtle
                             local target_hwid = nearestIdleTurtle(loc.x, loc.y, loc.z, nil)
                             if target_hwid then
                                 local f = fleet[target_hwid]
@@ -1117,7 +1152,7 @@ local function orderThread()
                                     order.jobs[lk] = true
                                     dispatched_this_tick = dispatched_this_tick + 1
                                     print(string.format(
-                                        "[ORDER]  getme %s: sent %s -> (%d,%d,%d) [%d/%d]",
+                                        "[ORDER]  getme %s: sent %s -> (%d,%d,%d) [~%d/%d]",
                                         ore_name, target_hwid,
                                         loc.x, loc.y, loc.z,
                                         effective + dispatched_this_tick, order.target))
@@ -1126,11 +1161,18 @@ local function orderThread()
                         end
                     end
 
-                    -- If we found no locations and no jobs are pending, warn.
-                    if dispatched_this_tick == 0 and pending == 0 then
+                    -- Only warn about no map data once per order, not every tick
+                    if dispatched_this_tick == 0 and pending == 0
+                    and not order.warned_empty then
+                        order.warned_empty = true
                         print(string.format(
-                            "[ORDER]  getme %s: no known %s on map. Mining fleet will report finds.",
-                            ore_name, ore_name))
+                            "[ORDER]  getme %s: no known locations on map yet. Waiting for fleet scans.",
+                            ore_name))
+                    end
+
+                    -- Clear the warning once ore appears on the map
+                    if dispatched_this_tick > 0 then
+                        order.warned_empty = false
                     end
                 end
             end
@@ -1186,7 +1228,8 @@ local function printHelp()
     print("  status                     fleet + supplies")
     print("  setdump x y z              set loot dump chest")
     print("  setbase x y z              set emergency coal chest")
-    print("  coords                     show chest coords")
+    print("  setpark x1 y1 z1 x2 y2 z2 define parking rectangle")
+    print("  coords                     show chest + park coords")
     print("  want <ore>                 add ore to auto-fetch list")
     print("  unwant <ore>               remove from auto-fetch list")
     print("  wants                      show auto-fetch list")
@@ -1251,6 +1294,14 @@ local function terminalThread()
         elseif cmd == "coords" then
             print(string.format("  Dump: (%d,%d,%d)", DUMP_CHEST.x, DUMP_CHEST.y, DUMP_CHEST.z))
             print(string.format("  Base: (%d,%d,%d)", BASE_CHEST.x, BASE_CHEST.y, BASE_CHEST.z))
+            if PARK_ZONE then
+                print(string.format("  Park: (%d,%d,%d) -> (%d,%d,%d)  %d slots",
+                    PARK_ZONE.x1, PARK_ZONE.y1, PARK_ZONE.z1,
+                    PARK_ZONE.x2, PARK_ZONE.y2, PARK_ZONE.z2,
+                    (math.abs(PARK_ZONE.x2-PARK_ZONE.x1)+1)*(math.abs(PARK_ZONE.z2-PARK_ZONE.z1)+1)))
+            else
+                print("  Park: not set (turtles park in place)")
+            end
 
         elseif cmd == "want" then
             if parts[2] then
@@ -1381,8 +1432,34 @@ local function terminalThread()
                 print("Usage: cancelorder <ore>")
             end
 
-        elseif cmd == "help" then
-            printHelp()
+        elseif cmd == "setpark" then
+            local x1,y1,z1 = tonumber(parts[2]),tonumber(parts[3]),tonumber(parts[4])
+            local x2,y2,z2 = tonumber(parts[5]),tonumber(parts[6]),tonumber(parts[7])
+            if x1 and y1 and z1 and x2 and y2 and z2 then
+                PARK_ZONE = {x1=x1,y1=y1,z1=z1, x2=x2,y2=y2,z2=z2}
+                saveConfig(); broadcastConfig()
+                local cols = math.abs(x2-x1)+1
+                local rows = math.abs(z2-z1)+1
+                print(string.format("[CFG]    Park zone set: (%d,%d,%d)->(%d,%d,%d)  %d slots (%dx%d).",
+                    x1,y1,z1, x2,y2,z2, cols*rows, cols, rows))
+                -- Re-send each turtle its park slot
+                local slot = 0
+                for hwid, f in pairs(fleet) do
+                    f.park_slot = slot
+                    local park_pos = getParkSlot(slot)
+                    rednet.send(f.net_id, {
+                        type="CONFIG", dump=DUMP_CHEST,
+                        base=BASE_CHEST, park=park_pos,
+                    }, PROTOCOL)
+                    print(string.format("  -> %s park slot (%d,%d,%d)",
+                        hwid, park_pos.x, park_pos.y, park_pos.z))
+                    slot = slot + 1
+                end
+            else
+                print("Usage: setpark x1 y1 z1 x2 y2 z2")
+                print("  Mark two opposite corners of the parking rectangle.")
+                print("  e.g. setpark 130 0 -320  145 0 -320")
+            end
 
         elseif cmd and cmd ~= "" then
             print("Unknown command: " .. cmd)
