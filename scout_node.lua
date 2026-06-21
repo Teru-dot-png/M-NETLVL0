@@ -588,11 +588,24 @@ local function gpsPos()
     return nil
 end
 
--- ============================================================
--- PICKAXE FETCH FROM BASE_CHEST
--- Uses peripheral.wrap on the chest to read its contents first,
--- then sucks only the slot that holds a pickaxe. No cycling.
--- ============================================================
+-- Returns true if a pickaxe item detail is fresh enough for CC:T to equip.
+-- CC:Tweaked ONLY equips undamaged, unenchanted diamond pickaxes.
+-- A damaged or NBT-tagged pick will be silently rejected by equipLeft().
+local function isEquippable(detail)
+    if not detail then return false end
+    if not tostring(detail.name or ""):find("pickaxe") then return false end
+    -- Check for damage (durability loss). The field is named "damage" in CC:T.
+    if (detail.damage or 0) > 0 then
+        log("PICK", string.format("Pickaxe in slot has %d damage. CC:T needs a fresh, undamaged pick.", detail.damage))
+        return false
+    end
+    -- Check for enchantments / NBT: enchanted picks are also unequippable.
+    if detail.enchantments and #detail.enchantments > 0 then
+        log("PICK", "Pickaxe is enchanted. CC:T cannot equip enchanted tools.")
+        return false
+    end
+    return true
+end
 local function fetchPickaxeFromBase(resumePos)
     if not base then
         log("PICK", "No BASE_CHEST set. Cannot fetch pickaxe. Halting.")
@@ -606,56 +619,61 @@ local function fetchPickaxeFromBase(resumePos)
     end
 
     local function tryFetch()
-        -- Try to read the chest inventory directly to find the pickaxe slot.
         local chest = peripheral.wrap("bottom")
         if chest and chest.list then
             local contents = chest.list()
             for chestSlot, item in pairs(contents) do
                 if tostring(item.name or ""):find("pickaxe") then
-                    log("PICK", string.format("Pickaxe in chest slot %d (%s). Pulling...", chestSlot, item.name))
-                    -- Find a free turtle slot and suck specifically that chest slot.
-                    for ts = 1, 15 do
-                        if turtle.getItemCount(ts) == 0 then
-                            turtle.select(ts)
-                            -- pushItems from chest to turtle is not always available;
-                            -- use suckDown and verify what we got.
-                            turtle.suckDown(1)
-                            local got = turtle.getItemDetail(ts)
-                            if got and tostring(got.name or ""):find("pickaxe") then
+                    -- Read full detail to check damage/enchants before pulling.
+                    local detail = chest.getItemDetail and chest.getItemDetail(chestSlot)
+                    if detail and not isEquippable(detail) then
+                        log("PICK", string.format("Slot %d: pickaxe rejected (damaged or enchanted). Need a fresh unenchanted one.", chestSlot))
+                    else
+                        log("PICK", string.format("Pickaxe in chest slot %d (%s). Pulling...", chestSlot, item.name))
+                        for ts = 1, 15 do
+                            if turtle.getItemCount(ts) == 0 then
                                 turtle.select(ts)
-                                turtle.equipLeft()
-                                if pickaxeEquipped() then
-                                    log("PICK", "Pickaxe equipped. OK")
-                                    turtle.select(1)
-                                    return true
+                                turtle.suckDown(1)
+                                local got = turtle.getItemDetail(ts)
+                                if got and isEquippable(got) then
+                                    turtle.select(ts)
+                                    turtle.equipLeft()
+                                    if pickaxeEquipped() then
+                                        log("PICK", "Pickaxe equipped. OK")
+                                        turtle.select(1)
+                                        return true
+                                    else
+                                        log("PICK", "equipLeft silently failed (item still ineligible). Putting back.")
+                                        turtle.dropDown()
+                                    end
+                                else
+                                    log("PICK", "Pulled item is damaged/enchanted. Putting back.")
+                                    turtle.select(ts)
+                                    turtle.dropDown()
                                 end
-                            else
-                                -- Got something else; put it back.
-                                turtle.select(ts)
-                                turtle.dropDown()
+                                break
                             end
-                            break
                         end
                     end
                 end
             end
         else
-            -- Fallback: chest not wrappable. Suck one item, check, return if wrong.
+            -- Fallback: no chest peripheral. Suck one at a time.
             for ts = 1, 15 do
                 if turtle.getItemCount(ts) == 0 then
                     turtle.select(ts)
                     if not turtle.suckDown(1) then break end
                     local got = turtle.getItemDetail(ts)
-                    if got and tostring(got.name or ""):find("pickaxe") then
+                    if got and isEquippable(got) then
                         turtle.equipLeft()
                         if pickaxeEquipped() then
                             log("PICK", "Pickaxe equipped (fallback). OK")
                             turtle.select(1)
                             return true
                         end
-                    else
-                        turtle.dropDown()
                     end
+                    log("PICK", "Item not usable as pickaxe upgrade. Putting back.")
+                    turtle.dropDown()
                     break
                 end
             end
@@ -1135,6 +1153,18 @@ local function brainThread()
     local tunnelled   = 0
     local was_started = false
 
+    -- If we booted without a pickaxe (e.g. only damaged ones were available),
+    -- fetch one now while the listener thread is already running and can
+    -- receive CMD_START. The fetch will block here but at least the heartbeat
+    -- keeps the overseer informed.
+    if not pickaxeEquipped() then
+        log("PICK", "Fetching pickaxe from BASE_CHEST before starting work...")
+        log("PICK", "IMPORTANT: Put a FRESH, UNDAMAGED, UNENCHANTED diamond pickaxe in the BASE_CHEST.")
+        fetchPickaxeFromBase(copy(pos))
+    end
+
+    log("STAND","Ready. Awaiting CMD_START from Overseer.")
+
     while true do
         if home_requested then
             home_requested = false
@@ -1267,10 +1297,11 @@ forageForCoal()
 -- STEP 5: Enlist with Overseer (this is when base + dump coords arrive)
 handshake()
 
--- STEP 6: Fetch pickaxe NOW if boot check failed (base coords arrived in step 5)
+-- STEP 6: Fetch pickaxe is now handled inside the brain thread,
+-- AFTER the parallel threads start, so CMD_START is never missed.
+-- Just log the status here.
 if not pickaxeEquipped() then
-    log("INIT", "Pickaxe still missing. Fetching from BASE_CHEST...")
-    fetchPickaxeFromBase(copy(pos))
+    log("INIT", "Pickaxe missing. Will fetch from BASE_CHEST once threads start.")
 end
 
 log("BOOT", string.format(
