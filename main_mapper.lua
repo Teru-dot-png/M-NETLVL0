@@ -1,6 +1,6 @@
 --[[
-    M-NET V3 | OVERSEER  (Phase 1-5)
-    ==================================
+    M-NET V3 | OVERSEER  (Phase 1-5 + post-launch fixes)
+    =======================================================
     Role : Fleet commander, warehouse monitor, and live map display.
 
     Hardware:
@@ -8,16 +8,31 @@
         Advanced Monitor : any side or array (the live cockpit display)
         Supply chest     : adjacent optional (for the warehouse readout)
 
+    Screens:
+        MONITOR  : three-panel cockpit — fleet roster (left), voxel map
+                   (centre), ore haul + supplies (right). Refreshes every
+                   0.5 s. Live ore feed cycles in the bottom row.
+        TERMINAL : command input and log. Type  help  for all commands.
+
     Phase 4  Lane assignment: spreads turtles across parallel tunnels
-             spaced LANE_SPACING blocks apart. Tracks exhausted zones.
+             spaced LANE_SPACING (4) blocks apart. Tracks exhausted zones.
              Commands: zones, newrun <hwid>
 
     Phase 5  Map persistence: voxel database saved to mnet_map.dat,
-             auto-loaded at boot and auto-saved every 60 seconds.
+             auto-loaded at boot, auto-saved every 60 s.
              Ore cluster detection: nearby reports merge into one GOTO
              dispatched to the nearest idle turtle.
              Live ore feed: bottom cockpit row cycles through last 8 finds.
              Commands: savemap, clearmap, feed
+
+    Post-launch fixes:
+        - handleGeoData now accepts air blocks so dug tunnels clear on the
+          map in real time. Previously all isAir() entries were skipped,
+          leaving stone where open corridors existed.
+        - Terminal thread fixed: orphaned map output removed from newrun
+          block, missing "help" elseif added, feed block end corrected.
+        - ORE_FEED, clusters, and related constants moved to file-scope
+          STATE block so renderFooter can see them before they are declared.
 
     Setup:
         Type  setdump x y z  to set the loot drop chest.
@@ -812,7 +827,55 @@ local function handleHeartbeat(msg)
 end
 
 -- ============================================================
--- PHASE 5B: ORE CLUSTER DETECTION
+-- ACTIVE ORDERS  (getme command)
+-- active_orders[ore_name] = {
+--     target  = number,   -- how many the user asked for
+--     got     = number,   -- confirmed mined so far this order
+--     jobs    = {},       -- set of coord keys currently dispatched
+-- }
+-- ============================================================
+local active_orders = {}
+
+local function countInDump(ore_name)
+    -- Count matching items already in the dump chest.
+    -- The ore name may arrive as "diamond" (shortname) or
+    -- "minecraft:diamond" (full). Match both.
+    if not vault then return 0 end
+    local ok, list = pcall(vault.list, vault)
+    if not ok or type(list) ~= "table" then return 0 end
+    local total = 0
+    for _, item in pairs(list) do
+        local n = tostring(item.name or "")
+        if n:find(ore_name, 1, true) or n == ore_name then
+            total = total + item.count
+        end
+    end
+    return total
+end
+
+-- Scan master_voxels for all blocks whose name contains ore_name.
+-- Returns a list of { x, y, z, name } sorted nearest-first to refpos.
+local function findOreInMap(ore_name, refpos)
+    local found = {}
+    for y, xt in pairs(master_voxels) do
+        for x, zt in pairs(xt) do
+            for z, name in pairs(zt) do
+                if type(name) == "string" and name:find(ore_name, 1, true) then
+                    found[#found+1] = { x=x, y=y, z=z, name=name }
+                end
+            end
+        end
+    end
+    -- Sort by Manhattan distance from refpos
+    if refpos then
+        table.sort(found, function(a, b)
+            local da = math.abs(a.x-refpos.x)+math.abs(a.y-refpos.y)+math.abs(a.z-refpos.z)
+            local db = math.abs(b.x-refpos.x)+math.abs(b.y-refpos.y)+math.abs(b.z-refpos.z)
+            return da < db
+        end)
+    end
+    return found
+end
 
 local function mergeOrCluster(ore_name, x, y, z)
     -- Find an existing cluster of the same ore type within CLUSTER_RADIUS
@@ -899,14 +962,29 @@ local function handleOreReport(msg)
 end
 
 local function handleGeoData(msg)
+    -- Ingest scan data into the voxel map.
+    -- Air blocks are now explicitly handled: they CLEAR the voxel so the map
+    -- reflects dug tunnels in real time. Previously isAir() blocks were
+    -- skipped entirely, leaving stone displayed where open corridors existed.
     local f = fleet[msg.hwid]
     if f then f.last_pulse = os.epoch("utc"); if msg.pos then f.pos = msg.pos end end
     local scan, p = msg.scan_data, msg.pos
     if type(scan) == "table" and type(p) == "table" then
         local ox, oy, oz = p.x or 0, p.y or 0, p.z or 0
         for _, b in ipairs(scan) do
-            if type(b) == "table" and type(b.name) == "string" and not isAir(b.name) then
-                setVoxel(floor(ox + (b.x or 0)), floor(oy + (b.y or 0)), floor(oz + (b.z or 0)), b.name)
+            if type(b) == "table" and type(b.name) == "string" then
+                local ax = floor(ox + (b.x or 0))
+                local ay = floor(oy + (b.y or 0))
+                local az = floor(oz + (b.z or 0))
+                if isAir(b.name) then
+                    -- Clear this voxel: tunnel was dug here
+                    if master_voxels[ay] and master_voxels[ay][ax] then
+                        master_voxels[ay][ax][az] = nil
+                    end
+                    map_dirty = true
+                else
+                    setVoxel(ax, ay, az, b.name)
+                end
             end
         end
     end
@@ -923,10 +1001,102 @@ local function listenerThread()
             elseif msg.type == "HEARTBEAT"  then handleHeartbeat(msg)
             elseif msg.type == "ORE_REPORT" then handleOreReport(msg)
             elseif msg.type == "GEO_DATA"   then handleGeoData(msg)
+            elseif msg.type == "ORE_MINED"  then
+                -- A turtle confirmed it mined an ore block.
+                -- Update any active order that matches.
+                local ore = tostring(msg.ore or "")
+                local k   = (msg.pos and (msg.pos.x..":"..msg.pos.y..":"..msg.pos.z)) or ""
+                for order_ore, order in pairs(active_orders) do
+                    if ore:find(order_ore, 1, true) or order_ore:find(ore, 1, true) then
+                        if order.jobs[k] then
+                            order.jobs[k] = nil
+                            order.got = order.got + 1
+                            print(string.format("[ORDER]  getme %s: %d/%d confirmed.",
+                                order_ore, order.got, order.target))
+                        end
+                    end
+                end
             elseif msg.type == "ALERT"      then
                 local al = tostring(msg.hwid) .. ": " .. tostring(msg.msg)
                 print("[ALERT]  " .. al)
                 pushAlert(al)
+            end
+        end
+    end
+end
+
+-- ============================================================
+-- ORDER THREAD  (drives getme commands)
+-- Runs a background loop. Every 3 seconds for each active order:
+--   1. Count items already in the dump chest (already collected).
+--   2. Scan the voxel map for known ore locations.
+--   3. Sort nearest-first and dispatch GOTO to idle turtles.
+--   4. Mark order complete when target is reached.
+-- ============================================================
+local function orderThread()
+    while true do
+        sleep(3)
+
+        for ore_name, order in pairs(active_orders) do
+
+            -- Count what is already in the dump chest
+            local in_chest = countInDump(ore_name)
+            local effective = math.max(order.got, in_chest)
+
+            if effective >= order.target then
+                print(string.format(
+                    "[ORDER]  getme %s COMPLETE: %d/%d in dump chest.",
+                    ore_name, in_chest, order.target))
+                active_orders[ore_name] = nil
+            else
+                local remaining = order.target - effective
+                local pending   = 0
+                for _ in pairs(order.jobs) do pending = pending + 1 end
+
+                -- How many more jobs can we dispatch right now?
+                local slots_open = remaining - pending
+                if slots_open > 0 then
+                    -- Find the centroid of the fleet as our distance reference
+                    local refpos = view_cx and { x=view_cx, y=view_y, z=view_cz }
+                                            or  { x=0, y=0, z=0 }
+
+                    local locations = findOreInMap(ore_name, refpos)
+                    local dispatched_this_tick = 0
+
+                    for _, loc in ipairs(locations) do
+                        if dispatched_this_tick >= slots_open then break end
+                        local lk = loc.x..":"..loc.y..":"..loc.z
+                        if not order.jobs[lk] then
+                            -- Find nearest idle turtle
+                            local target_hwid = nearestIdleTurtle(loc.x, loc.y, loc.z, nil)
+                            if target_hwid then
+                                local f = fleet[target_hwid]
+                                if f then
+                                    rednet.send(f.net_id, {
+                                        type = "GOTO",
+                                        hwid = target_hwid,
+                                        ore  = ore_name,
+                                        pos  = { x=loc.x, y=loc.y, z=loc.z },
+                                    }, PROTOCOL)
+                                    order.jobs[lk] = true
+                                    dispatched_this_tick = dispatched_this_tick + 1
+                                    print(string.format(
+                                        "[ORDER]  getme %s: sent %s -> (%d,%d,%d) [%d/%d]",
+                                        ore_name, target_hwid,
+                                        loc.x, loc.y, loc.z,
+                                        effective + dispatched_this_tick, order.target))
+                                end
+                            end
+                        end
+                    end
+
+                    -- If we found no locations and no jobs are pending, warn.
+                    if dispatched_this_tick == 0 and pending == 0 then
+                        print(string.format(
+                            "[ORDER]  getme %s: no known %s on map. Mining fleet will report finds.",
+                            ore_name, ore_name))
+                    end
+                end
             end
         end
     end
@@ -976,19 +1146,25 @@ local function parseCoords(a, b, c)
 end
 local function printHelp()
     print("Commands:")
-    print("  start | stop | recall   deploy / halt / call home")
-    print("  status                  fleet + supplies")
-    print("  setdump x y z           set loot dump chest")
-    print("  setbase x y z           set emergency coal chest")
-    print("  coords                  show chest coords")
-    print("  want <ore> | unwant <ore> | wants")
-    print("  zones                   show tunnel zone assignments")
-    print("  newrun <hwid>           assign a fresh lane to a parked turtle")
-    print("  map                     map stats and file info")
-    print("  savemap                 force-save voxel map to disk now")
-    print("  clearmap                wipe the voxel map")
-    print("  feed                    show live ore feed (last 8 finds)")
-    print("  help")
+    print("  start | stop | recall      deploy / halt / call home")
+    print("  status                     fleet + supplies")
+    print("  setdump x y z              set loot dump chest")
+    print("  setbase x y z              set emergency coal chest")
+    print("  coords                     show chest coords")
+    print("  want <ore>                 add ore to auto-fetch list")
+    print("  unwant <ore>               remove from auto-fetch list")
+    print("  wants                      show auto-fetch list")
+    print("  getme <ore> <count>        dispatch fleet to collect N ore")
+    print("    e.g.  getme diamond 128")
+    print("  orders                     show active getme orders")
+    print("  cancelorder <ore>          cancel a getme order")
+    print("  zones                      show tunnel lane assignments")
+    print("  newrun <hwid>              give a parked turtle a fresh lane")
+    print("  map                        voxel map stats")
+    print("  savemap                    force-save map to disk")
+    print("  clearmap                   wipe the voxel map")
+    print("  feed                       show last 8 ore finds")
+    print("  help                       this list")
 end
 
 local function terminalThread()
@@ -997,51 +1173,75 @@ local function terminalThread()
         local cmd = parts[1]
 
         if cmd == "start" then
-            rednet.broadcast({ type = "CMD_START" }, PROTOCOL); print("[CMD]    Fleet deployed.")
+            rednet.broadcast({ type = "CMD_START" }, PROTOCOL)
+            print("[CMD]    Fleet deployed.")
+
         elseif cmd == "stop" then
-            rednet.broadcast({ type = "CMD_STOP" }, PROTOCOL); print("[CMD]    Halt-in-place sent.")
+            rednet.broadcast({ type = "CMD_STOP" }, PROTOCOL)
+            print("[CMD]    Halt-in-place sent.")
+
         elseif cmd == "recall" then
-            rednet.broadcast({ type = "CMD_RECALL" }, PROTOCOL); print("[CMD]    Recall sent.")
+            rednet.broadcast({ type = "CMD_RECALL" }, PROTOCOL)
+            print("[CMD]    Recall sent. Turtles will dump and park.")
+
         elseif cmd == "status" then
             print("---- FLEET ----")
             for hwid, f in pairs(fleet) do
                 local p = f.pos or {}
-                print(string.format("  %s dir%d %s fuel:%s free:%s (%d,%d,%d)",
-                    hwid, f.dir or 0, f.status or "?", tostring(f.fuel), tostring(f.free),
+                print(string.format("  %-10s dir=%d %-10s fuel=%-6s free=%-2s (%d,%d,%d)",
+                    hwid, f.dir or 0, f.status or "?",
+                    tostring(f.fuel), tostring(f.free),
                     p.x or 0, p.y or 0, p.z or 0))
             end
             print("---- SUPPLIES ----")
-            for name, count in pairs(checkSupplies()) do print(string.format("  %-18s %d", name, count)) end
+            for name, count in pairs(checkSupplies()) do
+                print(string.format("  %-20s %d", name, count))
+            end
+
         elseif cmd == "setdump" then
             local c = parseCoords(parts[2], parts[3], parts[4])
-            if c then DUMP_CHEST = c saveConfig() broadcastConfig()
-                print(string.format("[CFG]    Dump chest set to (%d,%d,%d).", c.x, c.y, c.z))
+            if c then
+                DUMP_CHEST = c; saveConfig(); broadcastConfig()
+                print(string.format("[CFG]    Dump chest -> (%d,%d,%d).", c.x, c.y, c.z))
             else print("Usage: setdump x y z") end
+
         elseif cmd == "setbase" then
             local c = parseCoords(parts[2], parts[3], parts[4])
-            if c then BASE_CHEST = c saveConfig() broadcastConfig()
-                print(string.format("[CFG]    Base chest set to (%d,%d,%d).", c.x, c.y, c.z))
+            if c then
+                BASE_CHEST = c; saveConfig(); broadcastConfig()
+                print(string.format("[CFG]    Base chest -> (%d,%d,%d).", c.x, c.y, c.z))
             else print("Usage: setbase x y z") end
+
         elseif cmd == "coords" then
             print(string.format("  Dump: (%d,%d,%d)", DUMP_CHEST.x, DUMP_CHEST.y, DUMP_CHEST.z))
             print(string.format("  Base: (%d,%d,%d)", BASE_CHEST.x, BASE_CHEST.y, BASE_CHEST.z))
+
         elseif cmd == "want" then
-            if parts[2] then WANT_LIST[parts[2]] = true saveConfig() print("[CFG]    Now fetching: " .. parts[2])
-            else print("Usage: want <ore>") end
+            if parts[2] then
+                WANT_LIST[parts[2]] = true; saveConfig()
+                print("[CFG]    Now fetching: " .. parts[2])
+            else print("Usage: want <ore_name>  e.g. want diamond") end
+
         elseif cmd == "unwant" then
-            if parts[2] then WANT_LIST[parts[2]] = nil saveConfig() print("[CFG]    No longer fetching: " .. parts[2])
-            else print("Usage: unwant <ore>") end
+            if parts[2] then
+                WANT_LIST[parts[2]] = nil; saveConfig()
+                print("[CFG]    Stopped fetching: " .. parts[2])
+            else print("Usage: unwant <ore_name>") end
+
         elseif cmd == "wants" then
             write("  Fetching: ")
             local any = false
-            for ore in pairs(WANT_LIST) do write(ore .. " ") any = true end
+            for ore in pairs(WANT_LIST) do write(ore .. "  "); any = true end
             print(any and "" or "(nothing)")
+
         elseif cmd == "zones" then
-            print("---- ZONES ----")
-            for hwid, z in pairs(zone_log) do
-                print(string.format("  %-10s dir=%d lane=+%d %s",
-                    hwid, z.dir, z.offset,
-                    z.exhausted and "[EXHAUSTED]" or "[ACTIVE]"))
+            if not next(zone_log) then print("  No zones assigned yet."); else
+                print("---- ZONES ----")
+                for hwid, z in pairs(zone_log) do
+                    print(string.format("  %-10s dir=%d lane=+%d %s",
+                        hwid, z.dir, z.offset,
+                        z.exhausted and "[EXHAUSTED]" or "[ACTIVE]"))
+                end
             end
 
         elseif cmd == "newrun" then
@@ -1049,47 +1249,105 @@ local function terminalThread()
             if target and fleet[target] then
                 local f = fleet[target]
                 local dir, offset = reassignLane(target)
-                f.dir         = dir
-                f.lane_offset = offset
+                f.dir = dir; f.lane_offset = offset
                 rednet.send(f.net_id, {
-                    type        = "CONFIG",
-                    direction   = dir,
-                    lane_offset = offset,
-                    dump        = DUMP_CHEST,
-                    base        = BASE_CHEST,
+                    type="CONFIG", direction=dir, lane_offset=offset,
+                    dump=DUMP_CHEST, base=BASE_CHEST,
                 }, PROTOCOL)
-                print(string.format("[CMD]    %s reassigned -> dir=%d lane=+%d", target, dir, offset))
+                print(string.format("[CMD]    %s -> dir=%d lane=+%d", target, dir, offset))
             elseif target then
-                print("Unknown turtle: "..target)
+                print("Unknown turtle: " .. target)
             else
-                print("Usage: newrun <hwid>")
+                print("Usage: newrun <hwid>   e.g. newrun MN-0014")
             end
-            print(string.format("  Voxels stored : %d", total_voxels))
-            print(string.format("  View centre   : (%d,%d)  layer Y=%d", view_cx, view_cz, view_y))
+
         elseif cmd == "map" then
-            print(string.format("  Voxels stored : %d", total_voxels))
-            print(string.format("  View centre   : (%d,%d)  layer Y=%d", view_cx, view_cz, view_y))
-            print(string.format("  Map file      : %s", fs.exists(MAP_FILE) and MAP_FILE or "not saved yet"))
+            print(string.format("  Voxels  : %d", total_voxels))
+            print(string.format("  Centre  : (%d,%d)  Y=%d", view_cx, view_cz, view_y))
+            print(string.format("  File    : %s", fs.exists(MAP_FILE) and MAP_FILE or "not saved yet"))
+            print(string.format("  Dirty   : %s", map_dirty and "yes (unsaved changes)" or "no"))
+
         elseif cmd == "savemap" then
             saveMap()
             print(string.format("[MAP]    Saved %d voxels to disk.", total_voxels))
+
         elseif cmd == "clearmap" then
             master_voxels = {}; total_voxels = 0; map_dirty = false
             if fs.exists(MAP_FILE) then fs.delete(MAP_FILE) end
             print("[MAP]    Voxel database cleared.")
+
         elseif cmd == "feed" then
-            if #ORE_FEED == 0 then print("  No ore found yet.")
+            if #ORE_FEED == 0 then
+                print("  No ore found yet.")
             else
-                print("---- ORE FEED ----")
+                print("---- ORE FEED (newest first) ----")
                 for i = #ORE_FEED, 1, -1 do
                     local e = ORE_FEED[i]
-                    print(string.format("  %s %-8s %-16s (%d,%d,%d)",
+                    print(string.format("  %s  %-10s  %-20s  (%d,%d,%d)",
                         e.time, e.hwid, e.ore, e.x, e.y, e.z))
                 end
             end
-            printHelp()
+
+        elseif cmd == "getme" then
+            -- Usage: getme <ore> <count>
+            -- Scans the map for known ore locations, dispatches GOTOs to
+            -- the nearest idle turtles, and keeps dispatching until the
+            -- target count arrives in the dump chest.
+            local ore_name = parts[2]
+            local target   = tonumber(parts[3])
+            if not ore_name or not target or target <= 0 then
+                print("Usage: getme <ore> <count>   e.g. getme diamond 128")
+            else
+                -- Cancel any previous order for this ore
+                if active_orders[ore_name] then
+                    print(string.format("[ORDER]  Replacing existing getme %s order.", ore_name))
+                end
+                active_orders[ore_name] = {
+                    target = target,
+                    got    = 0,
+                    jobs   = {},
+                }
+                local in_chest = countInDump(ore_name)
+                local on_map   = #findOreInMap(ore_name, nil)
+                print(string.format(
+                    "[ORDER]  getme %s x%d started. In chest: %d. Known on map: %d locations.",
+                    ore_name, target, in_chest, on_map))
+                if in_chest >= target then
+                    print(string.format("[ORDER]  Already have %d in dump chest. Order complete.", in_chest))
+                    active_orders[ore_name] = nil
+                elseif on_map == 0 then
+                    print("[ORDER]  No known locations on map yet. Fleet will report finds as it mines.")
+                end
+            end
+
+        elseif cmd == "orders" then
+            if not next(active_orders) then
+                print("  No active orders.")
+            else
+                print("---- ACTIVE ORDERS ----")
+                for ore_name, order in pairs(active_orders) do
+                    local in_chest = countInDump(ore_name)
+                    local pending  = 0
+                    for _ in pairs(order.jobs) do pending = pending + 1 end
+                    print(string.format("  getme %-14s %d/%d  in_chest=%d  jobs_out=%d",
+                        ore_name, order.got, order.target, in_chest, pending))
+                end
+            end
+
+        elseif cmd == "cancelorder" then
+            local ore_name = parts[2]
+            if ore_name and active_orders[ore_name] then
+                active_orders[ore_name] = nil
+                print("[ORDER]  Cancelled getme " .. ore_name)
+            elseif ore_name then
+                print("No active order for: " .. ore_name)
+            else
+                print("Usage: cancelorder <ore>")
+            end
+
         elseif cmd and cmd ~= "" then
-            print("Unknown command: " .. cmd .. "   (type help)")
+            print("Unknown command: " .. cmd)
+            print("Type  help  for the full list.")
         end
     end
 end
@@ -1114,4 +1372,4 @@ print("  Type  help  for the command list.")
 print("  Waiting for miners to enlist...")
 print("")
 
-parallel.waitForAll(listenerThread, prunerThread, displayThread, terminalThread, mapSaveThread)
+parallel.waitForAll(listenerThread, prunerThread, displayThread, terminalThread, mapSaveThread, orderThread)
