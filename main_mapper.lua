@@ -162,7 +162,7 @@ local function broadcastConfig()
     -- the setpark command loop. Sending PARK_ZONE here would corrupt
     -- turtle park_pos (they expect {x,y,z} not {x1,y1,z1,x2,y2,z2}).
     rednet.broadcast({
-        type = "CONFIG", dump = DUMP_CHEST, base = BASE_CHEST,
+        type = "CONFIG", dump = DUMP_CHEST, base = BASE_CHEST, want = WANT_LIST,
     }, PROTOCOL)
 end
 
@@ -194,6 +194,7 @@ local MOVE_PRIORITY_MAP = {
 -- master_voxels[y][x][z] = blockName ; absolute world coords
 local master_voxels = {}
 local total_voxels  = 0
+local AIR_MARKER    = "__air__"  -- known, scanned air cell (dug tunnel)
 
 local view_cx, view_cz, view_y = 0, 0, 64
 
@@ -231,6 +232,7 @@ local last_map_save = 0
 --   so storing it wastes space for zero benefit
 local function shouldStore(name)
     if not name or name == "" then return false end
+    if name == AIR_MARKER        then return true  end  -- tracked tunnel air
     if name:find("air")          then return true  end  -- tunnel corridor
     if name:find("_ore")         then return true  end  -- ore targets
     if name:find("lava")         then return true  end  -- hazard
@@ -359,7 +361,7 @@ local AIR_NAMES = {
     ["minecraft:air"]=true, ["air"]=true, ["minecraft:cave_air"]=true,
     ["minecraft:void_air"]=true, [""]=true,
 }
-local function isAir(n) return n == nil or AIR_NAMES[n] == true end
+local function isAir(n) return n == nil or n == AIR_MARKER or AIR_NAMES[n] == true end
 local function isOre(n) return n ~= nil and n:find("_ore", 1, true) ~= nil end
 
 local WALL_GLYPH = { [0]="#", [1]="+", [2]="-" }
@@ -548,6 +550,15 @@ local function oreColor(name)
     return ORE_COLOUR[base] or colors.white
 end
 
+local function normalizeOreName(name)
+    local n = tostring(name or "")
+    n = n:match("deepslate_(.-)_ore$")
+     or n:match("nether_(.-)_ore$")
+     or n:match("(.-)_ore$")
+     or n
+    return n
+end
+
 -- ── PANEL: HEADER (rows 1-3) ───────────────────────────────────────────
 
 local function renderHeader(w)
@@ -558,7 +569,7 @@ local function renderHeader(w)
 
     -- Row 1: title + clock
     local title = string.format(
-        " M-NET V3  OVERSEER  ID:%-3d      %s  UP %02d:%02d:%02d ",
+        " O-NET X  OVERSEER  ID:%-3d      %s  UP %02d:%02d:%02d ",
         os.getComputerID(), os.date("%H:%M:%S"), uh, um, us)
     solidRow(1, title, colors.black, colors.cyan, w)
 
@@ -777,22 +788,42 @@ local function renderMap(first_row, last_row, map_col_start, map_col_end)
                     ch = (st == "MINING") and "@" or (st == "DUMP" and "D" or "?")
                     fg = c2b(statusColor(st))
                 elseif in_range then
+                    local saw_known_air = false
                     for d = 0, RAYCAST_DEPTH - 1 do
                         local vn = getVoxel(world_x, view_y - d, world_z)
-                        if not isAir(vn) then
+                        if vn == AIR_MARKER then
+                            saw_known_air = true
+                        elseif not isAir(vn) then
                             local bc, bfg = renderCell(vn, d)
                             ch, fg = bc, c2b(bfg)
                             break
                         end
                     end
+                    if ch == " " then
+                        if saw_known_air then
+                            ch, fg = " ", BLK
+                        else
+                            ch, fg = "#", c2b(colors.yellow)
+                        end
+                    end
                 end
             elseif in_range then
+                local saw_known_air = false
                 for d = 0, RAYCAST_DEPTH - 1 do
                     local vn = getVoxel(world_x, view_y - d, world_z)
-                    if not isAir(vn) then
+                    if vn == AIR_MARKER then
+                        saw_known_air = true
+                    elseif not isAir(vn) then
                         local tc, tfg = renderCell(vn, d)
                         ch, fg = tc, c2b(tfg)
                         break
+                    end
+                end
+                if ch == " " then
+                    if saw_known_air then
+                        ch, fg = " ", BLK
+                    else
+                        ch, fg = "#", c2b(colors.yellow)
                     end
                 end
             end
@@ -824,7 +855,8 @@ local function renderFooter(h, w)
     legItem("@", colors.magenta, "Robot")
     legItem("D", colors.orange,  "Dump")
     legItem("B", colors.cyan,    "Base")
-    legItem("#", colors.yellow,  "Stone")
+    legItem("#", colors.yellow,  "Unknown/Rock")
+    legItem(" ", colors.black,   "Tunnel Air")
     legItem("d", colors.cyan,    "Ore")
     while #leg_t < w do leg_t[#leg_t+1]=" "; leg_f[#leg_f+1]=BLK; leg_b[#leg_b+1]=BLK end
     mon.setCursorPos(1, h - 1)
@@ -902,6 +934,7 @@ local function handleAuth(net_id, msg)
         lane_offset = offset,
         dump        = DUMP_CHEST,
         base        = BASE_CHEST,
+        want        = WANT_LIST,
         park        = park_pos,
     }, PROTOCOL)
 
@@ -938,6 +971,97 @@ end
 -- }
 -- ============================================================
 local active_orders = {}
+
+-- Tile reservations for collision prevention.
+-- reservations["x:y:z"] = { hwid = "MN-0001", expires = epoch_ms }
+local reservations = {}
+
+local function reserveKey(p)
+    local x = math.floor(tonumber(p.x) or 0)
+    local y = math.floor(tonumber(p.y) or 0)
+    local z = math.floor(tonumber(p.z) or 0)
+    return x .. ":" .. y .. ":" .. z
+end
+
+local function cleanupReservations(now)
+    now = now or os.epoch("utc")
+    for k, r in pairs(reservations) do
+        if type(r) ~= "table" or (tonumber(r.expires) or 0) <= now then
+            reservations[k] = nil
+        end
+    end
+end
+
+local function clearReservationsFor(hwid)
+    for k, r in pairs(reservations) do
+        if type(r) == "table" and r.hwid == hwid then
+            reservations[k] = nil
+        end
+    end
+end
+
+local function isOccupiedByOther(want, requester_hwid)
+    local tx = math.floor(tonumber(want.x) or 0)
+    local ty = math.floor(tonumber(want.y) or 0)
+    local tz = math.floor(tonumber(want.z) or 0)
+    for hwid, f in pairs(fleet) do
+        if hwid ~= requester_hwid and f.pos then
+            local p = f.pos
+            if math.floor(tonumber(p.x) or 0) == tx
+            and math.floor(tonumber(p.y) or 0) == ty
+            and math.floor(tonumber(p.z) or 0) == tz then
+                return hwid
+            end
+        end
+    end
+    return nil
+end
+
+local function handleReserveReq(net_id, msg)
+    if type(msg.hwid) ~= "string" or type(msg.want) ~= "table" then return end
+    cleanupReservations()
+
+    local now = os.epoch("utc")
+    local k = reserveKey(msg.want)
+    local ttl = math.floor(tonumber(msg.ttl_ms) or 1200)
+    ttl = math.max(250, math.min(4000, ttl))
+
+    local occupied_by = isOccupiedByOther(msg.want, msg.hwid)
+    local existing = reservations[k]
+    local granted = false
+    local owner = nil
+
+    if occupied_by then
+        granted = false
+        owner = occupied_by
+    elseif existing and existing.hwid ~= msg.hwid and (tonumber(existing.expires) or 0) > now then
+        granted = false
+        owner = existing.hwid
+    else
+        reservations[k] = { hwid = msg.hwid, expires = now + ttl }
+        granted = true
+        owner = msg.hwid
+    end
+
+    rednet.send(net_id, {
+        type    = "RESERVE_ACK",
+        hwid    = msg.hwid,
+        nonce   = msg.nonce,
+        granted = granted,
+        owner   = owner,
+        want    = msg.want,
+    }, PROTOCOL)
+end
+
+local function handleReserveRel(msg)
+    if type(msg.hwid) ~= "string" or type(msg.want) ~= "table" then return end
+    cleanupReservations()
+    local k = reserveKey(msg.want)
+    local r = reservations[k]
+    if r and r.hwid == msg.hwid then
+        reservations[k] = nil
+    end
+end
 
 local function countInDump(ore_name)
     -- Count matching items already in the dump chest.
@@ -1032,17 +1156,18 @@ end
 local function handleOreReport(msg)
     if type(msg.ore) ~= "string" or type(msg.pos) ~= "table" then return end
     local ore = msg.ore
+    local ore_key = normalizeOreName(ore)
     local x, y, z = math.floor(msg.pos.x or 0), math.floor(msg.pos.y or 0), math.floor(msg.pos.z or 0)
 
     -- Update running total
-    ore_log[ore] = (ore_log[ore] or 0) + 1
+    ore_log[ore_key] = (ore_log[ore_key] or 0) + 1
 
     -- Push to live feed
-    pushOreFeed(ore, msg.hwid, x, y, z)
+    pushOreFeed(ore_key, msg.hwid, x, y, z)
 
     -- Phase 5B: cluster-aware dispatch
-    if WANT_LIST[ore] then
-        local cl = mergeOrCluster(ore, x, y, z)
+    if WANT_LIST[ore_key] then
+        local cl = mergeOrCluster(ore_key, x, y, z)
         if not cl.dispatched then
             cl.dispatched = true
             -- Dispatch the nearest idle turtle (not necessarily the reporter)
@@ -1053,11 +1178,11 @@ local function handleOreReport(msg)
                     rednet.send(f.net_id, {
                         type = "GOTO",
                         hwid = target_hwid,
-                        ore  = ore,
+                        ore  = ore_key,
                         pos  = { x=cl.cx, y=cl.cy, z=cl.cz },
                     }, PROTOCOL)
                     print(string.format("[ORDER]  %s -> GOTO %s cluster(%d,%d,%d) size=%d",
-                        target_hwid, ore, cl.cx, cl.cy, cl.cz, cl.count))
+                        target_hwid, ore_key, cl.cx, cl.cy, cl.cz, cl.count))
                 end
             end
         end
@@ -1066,9 +1191,8 @@ end
 
 local function handleGeoData(msg)
     -- Ingest scan data into the voxel map.
-    -- Air blocks are now explicitly handled: they CLEAR the voxel so the map
-    -- reflects dug tunnels in real time. Previously isAir() blocks were
-    -- skipped entirely, leaving stone displayed where open corridors existed.
+    -- Air blocks are explicitly tracked as AIR_MARKER so the map can render
+    -- tunnels distinctly from unknown/solid areas.
     local f = fleet[msg.hwid]
     if f then f.last_pulse = os.epoch("utc"); if msg.pos then f.pos = msg.pos end end
     local scan, p = msg.scan_data, msg.pos
@@ -1080,13 +1204,7 @@ local function handleGeoData(msg)
                 local ay = floor(oy + (b.y or 0))
                 local az = floor(oz + (b.z or 0))
                 if isAir(b.name) then
-                    -- Clear this voxel: tunnel was dug here
-                    if master_voxels[ay] and master_voxels[ay][ax]
-                    and master_voxels[ay][ax][az] ~= nil then
-                        master_voxels[ay][ax][az] = nil
-                        total_voxels = math.max(0, total_voxels - 1)
-                    end
-                    map_dirty = true
+                    setVoxel(ax, ay, az, AIR_MARKER)
                 else
                     setVoxel(ax, ay, az, b.name)
                 end
@@ -1139,6 +1257,12 @@ local function listenerThread()
                 local al = tostring(msg.hwid) .. ": " .. tostring(msg.msg)
                 print("[ALERT]  " .. al)
                 pushAlert(al)
+
+            elseif msg.type == "RESERVE_REQ" then
+                handleReserveReq(net_id, msg)
+
+            elseif msg.type == "RESERVE_REL" then
+                handleReserveRel(msg)
 
             -- O-NET V1: Push protocol broker.
             -- A turtle broadcasts PUSH_REQ when stuck. We find who is at
@@ -1264,6 +1388,7 @@ local function prunerThread()
             if (now - f.last_pulse) > HB_TIMEOUT then
                 print("[LOST]   " .. hwid .. " went silent (chunk unload or crash).")
                 pushAlert(hwid .. " LOST SIGNAL")
+                clearReservationsFor(hwid)
                 fleet[hwid] = nil
             end
         end
@@ -1391,7 +1516,7 @@ local function terminalThread()
                 f.dir = dir; f.lane_offset = offset
                 rednet.send(f.net_id, {
                     type="CONFIG", direction=dir, lane_offset=offset,
-                    dump=DUMP_CHEST, base=BASE_CHEST,
+                    dump=DUMP_CHEST, base=BASE_CHEST, want=WANT_LIST,
                 }, PROTOCOL)
                 print(string.format("[CMD]    %s -> dir=%d lane=+%d", target, dir, offset))
             elseif target then
@@ -1501,7 +1626,7 @@ local function terminalThread()
                     local park_pos = getParkSlot(slot)
                     rednet.send(f.net_id, {
                         type="CONFIG", dump=DUMP_CHEST,
-                        base=BASE_CHEST, park=park_pos,
+                        base=BASE_CHEST, want=WANT_LIST, park=park_pos,
                     }, PROTOCOL)
                     print(string.format("  -> %s park slot (%d,%d,%d)",
                         hwid, park_pos.x, park_pos.y, park_pos.z))

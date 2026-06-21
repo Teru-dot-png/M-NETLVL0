@@ -98,6 +98,17 @@ local started        = false
 local home_requested = false
 local jobs           = {}
 local reported       = {}
+local fuel_retry_streak = 0
+local WANT_LIST      = {}
+local probe_ticks    = 0
+local reservation_nonce   = 0
+local reservation_pending = {}
+local RESERVE_TTL_MS      = 1400
+local RESERVE_WAIT_MS     = 700
+local nav_last_want       = nil
+local recent_tiles        = {}
+local recent_tile_index   = 1
+local RECENT_TILE_WINDOW  = 24
 
 local pos    = { x = 0, y = 0, z = 0 }
 local facing = 0
@@ -117,6 +128,69 @@ local gpsSyncPos
 local function copy(p) return { x=p.x, y=p.y, z=p.z } end
 local function key(p)  return p.x..":"..p.y..":"..p.z end
 local function shortName(n) return (n:match(":(.+)") or n) end
+
+local function noteRecentTile(p)
+    if type(p) ~= "table" then return end
+    recent_tiles[recent_tile_index] = { x = p.x, y = p.y, z = p.z }
+    recent_tile_index = (recent_tile_index % RECENT_TILE_WINDOW) + 1
+end
+
+local function recentPenalty(x, y, z)
+    local hits = 0
+    for _, p in pairs(recent_tiles) do
+        if p and p.x == x and p.y == y and p.z == z then
+            hits = hits + 1
+        end
+    end
+    return hits * 1.5
+end
+
+local function requestMoveReservation(target)
+    if not server_id or type(target) ~= "table" then return true end
+    reservation_nonce = reservation_nonce + 1
+    local nonce = reservation_nonce
+    reservation_pending[nonce] = { done = false, granted = false }
+
+    pcall(rednet.send, server_id, {
+        type   = "RESERVE_REQ",
+        hwid   = hwid,
+        nonce  = nonce,
+        want   = target,
+        ttl_ms = RESERVE_TTL_MS,
+    }, PROTOCOL)
+
+    local deadline = os.epoch("utc") + RESERVE_WAIT_MS
+    while os.epoch("utc") < deadline do
+        local state = reservation_pending[nonce]
+        if state and state.done then
+            reservation_pending[nonce] = nil
+            return state.granted == true
+        end
+        sleep(0.05)
+    end
+
+    reservation_pending[nonce] = nil
+    -- Fail open: if comms are laggy, avoid freezing movement.
+    return true
+end
+
+local function releaseMoveReservation(target)
+    if not server_id or type(target) ~= "table" then return end
+    pcall(rednet.send, server_id, {
+        type = "RESERVE_REL",
+        hwid = hwid,
+        want = target,
+    }, PROTOCOL)
+end
+
+local function normalizeOreName(name)
+    local n = tostring(name or "")
+    n = n:match("deepslate_(.-)_ore$")
+     or n:match("nether_(.-)_ore$")
+     or n:match("(.-)_ore$")
+     or n
+    return n
+end
 
 local function log(tag, msg)
     print(string.format("[%-6s] %s", tag, msg))
@@ -341,18 +415,11 @@ local function equipOnPickaxeSide()
     else                            return turtle.equipRight() end
 end
 
--- CC:T equip rules: undamaged + unenchanted. Forge tag NBT is fine.
+-- Treat any pickaxe as usable. Overly strict damage/enchant filters
+-- caused false negatives and fetch dead-loops.
 local function isEquippable(detail)
     if not detail then return false end
     if not tostring(detail.name or ""):find("pickaxe") then return false end
-    if (detail.damage or 0) > 0 then
-        log("PICK", string.format("Rejected: %d damage. Need full durability.", detail.damage))
-        return false
-    end
-    if detail.enchantments and #detail.enchantments > 0 then
-        log("PICK", "Rejected: enchanted. CC:T cannot equip enchanted tools.")
-        return false
-    end
     return true
 end
 
@@ -528,14 +595,15 @@ DIRS6={
 }
 
 -- Short-range A* for obstacle detours (512 node budget)
-local function astarLocal(start,goal)
+local function astarLocal(start,goal,node_budget)
     local function h(n) return math.abs(n.x-goal.x)+math.abs(n.y-goal.y)+math.abs(n.z-goal.z) end
     local open=newHeap(); local g_cost,came={},{}
-    g_cost[key(start)]=0; heapPush(open,start,h(start))
+    g_cost[key(start)]=0; heapPush(open,{x=start.x,y=start.y,z=start.z,dir=nil},h(start))
+    local budget = math.max(128, tonumber(node_budget) or 512)
     local exp=0
     while open.n>0 do
         local cur=heapPop(open); local ck=key(cur); exp=exp+1
-        if exp>512 then return nil end
+        if exp>budget then return nil end
         if cur.x==goal.x and cur.y==goal.y and cur.z==goal.z then
             local path,k={},ck
             while came[k] do table.insert(path,1,came[k].step); k=came[k].pk end
@@ -546,11 +614,16 @@ local function astarLocal(start,goal)
             local nx,ny,nz=cur.x+nb.dx,cur.y+nb.dy,cur.z+nb.dz
             local nc=navCost(nx,ny,nz)
             if nc then
-                local nk=nx..":"..ny..":"..nz; local ng=g+nc
+                local turn_pen = 0
+                if nb.dy ~= 0 then turn_pen = turn_pen + 0.8 end
+                if cur.dir and cur.dir >= 0 and nb.dir >= 0 and cur.dir ~= nb.dir then
+                    turn_pen = turn_pen + 0.4
+                end
+                local nk=nx..":"..ny..":"..nz; local ng=g+nc+turn_pen+recentPenalty(nx,ny,nz)
                 if not g_cost[nk] or ng<g_cost[nk] then
                     g_cost[nk]=ng
                     came[nk]={pk=ck,step={dx=nb.dx,dy=nb.dy,dz=nb.dz,dir=nb.dir}}
-                    heapPush(open,{x=nx,y=ny,z=nz},ng+h({x=nx,y=ny,z=nz}))
+                    heapPush(open,{x=nx,y=ny,z=nz,dir=nb.dir},ng+h({x=nx,y=ny,z=nz}))
                 end
             end
         end
@@ -565,9 +638,19 @@ local function executeDetour(path)
         elseif step.dy==-1 then ok=stepDown()
         else face(step.dir); ok=stepForward() end
         if not ok then return false end
+        noteRecentTile(pos)
         sleep(0)
     end
     return true
+end
+
+local function adaptiveAStarBudget(start, goal, detours)
+    local dist = math.abs(start.x-goal.x) + math.abs(start.y-goal.y) + math.abs(start.z-goal.z)
+    local stuck = tonumber(nav_stuck_cnt) or 0
+    local b = dist * 18 + (tonumber(detours) or 0) * 128 + stuck * 96
+    if b < 256 then b = 256 end
+    if b > 2048 then b = 2048 end
+    return math.floor(b)
 end
 
 -- ── PHASE 3A: GPS RESYNC ─────────────────────────────────
@@ -620,6 +703,7 @@ end
 -- ── Greedy single step ───────────────────────────────────
 local function greedyStep(goal)
     if pos.x==goal.x and pos.y==goal.y and pos.z==goal.z then return "arrived" end
+    nav_last_want = nil
     local dx,dy,dz = goal.x-pos.x, goal.y-pos.y, goal.z-pos.z
     local axes = {
         {math.abs(dx), dx~=0 and (dx>0 and 1 or 3) or nil, "h"},
@@ -631,11 +715,25 @@ local function greedyStep(goal)
         if ax[1]>0 then
             local skip=false
             if ax[3]=="u" then
-                if stepUp() then return "moved" end
+                local target = { x = pos.x, y = pos.y + 1, z = pos.z }
+                nav_last_want = target
+                if requestMoveReservation(target) then
+                    local ok = stepUp()
+                    releaseMoveReservation(target)
+                    if ok then return "moved" end
+                end
             elseif ax[3]=="d" then
-                if stepDown() then return "moved" end
+                local target = { x = pos.x, y = pos.y - 1, z = pos.z }
+                nav_last_want = target
+                if requestMoveReservation(target) then
+                    local ok = stepDown()
+                    releaseMoveReservation(target)
+                    if ok then return "moved" end
+                end
             else
                 face(ax[2])
+                local target = { x = pos.x + DIRV[facing].dx, y = pos.y, z = pos.z + DIRV[facing].dz }
+                nav_last_want = target
                 local ok_i,dat_i = turtle.inspect()
                 if ok_i and type(dat_i)=="table" then
                     local name=dat_i.name or ""
@@ -645,7 +743,11 @@ local function greedyStep(goal)
                         skip=true
                     end
                 end
-                if not skip then if stepForward() then return "moved" end end
+                if not skip and requestMoveReservation(target) then
+                    local ok = stepForward()
+                    releaseMoveReservation(target)
+                    if ok then return "moved" end
+                end
             end
         end
     end
@@ -813,6 +915,7 @@ function moveTo(goal)
             if after.x ~= before.x or after.y ~= before.y or after.z ~= before.z then
                 nav_stuck_cnt = 0
                 nav_prev_pos = after
+                noteRecentTile(after)
                 -- O-NET V1: random repath probability instead of fixed cadence.
                 -- Expected frequency same as % 8 but spread across the fleet.
                 if math.random() < 0.15 then gpsSyncPos() end
@@ -831,14 +934,19 @@ function moveTo(goal)
                     -- O-NET V1: PUSH protocol (Overmind pushCreep equivalent).
                     -- Broadcast our position and priority so any turtle blocking
                     -- our target tile will yield if their priority is lower urgency.
-                    local dx = wp.x - pos.x
-                    local dz = wp.z - pos.z
-                    local dy = wp.y - pos.y
-                    local target = {
-                        x = pos.x + (dx~=0 and (dx>0 and 1 or -1) or 0),
-                        y = pos.y + (dy~=0 and (dy>0 and 1 or -1) or 0),
-                        z = pos.z + (dz~=0 and (dz>0 and 1 or -1) or 0),
-                    }
+                    local target = nav_last_want
+                    if not target then
+                        local dx = wp.x - pos.x
+                        local dy = wp.y - pos.y
+                        local dz = wp.z - pos.z
+                        if math.abs(dx) >= math.abs(dz) and math.abs(dx) >= math.abs(dy) and dx ~= 0 then
+                            target = { x = pos.x + (dx > 0 and 1 or -1), y = pos.y, z = pos.z }
+                        elseif math.abs(dz) >= math.abs(dy) and dz ~= 0 then
+                            target = { x = pos.x, y = pos.y, z = pos.z + (dz > 0 and 1 or -1) }
+                        elseif dy ~= 0 then
+                            target = { x = pos.x, y = pos.y + (dy > 0 and 1 or -1), z = pos.z }
+                        end
+                    end
                     pcall(rednet.broadcast, {
                         type     = "PUSH_REQ",
                         hwid     = hwid,
@@ -855,14 +963,15 @@ function moveTo(goal)
                     if snap and #snap>0 then feedCache(snap,pos) end
 
                     -- Try A* detour first
-                    local path = astarLocal(pos, wp)
+                    local budget = adaptiveAStarBudget(pos, wp, detours)
+                    local path = astarLocal(pos, wp, budget)
                     if path and #path > 0 then
-                        log("NAV","A* detour: "..(#path).." steps.")
+                        log("NAV","A* detour: "..(#path).." steps (budget="..budget..").")
                         if not executeDetour(path) then
                             log("NAV","Detour execution failed.")
                         end
                     else
-                        log("NAV","A* found no path. Trying recovery spiral.")
+                        log("NAV","A* found no path (budget="..budget.."). Trying recovery spiral.")
                         if not recoverSpiral(wp) then
                             if detours >= MAX_DETOURS then
                                 log("NAV","All recovery attempts exhausted. Reporting STUCK.")
@@ -1107,6 +1216,29 @@ local function reportOres(scan)
 end
 
 local function sendSnapshot(scan)
+
+    local function hasUnknownAhead()
+        local dv = DIRV[facing]
+        local fx = pos.x + dv.dx
+        local fz = pos.z + dv.dz
+        -- Probe trigger: any unknown in the immediate forward tunnel prism.
+        return cacheGet(fx, pos.y,   fz) == nil
+            or cacheGet(fx, pos.y+1, fz) == nil
+            or cacheGet(fx, pos.y-1, fz) == nil
+    end
+
+    local function scanForWanted(scan)
+        for _, b in ipairs(scan or {}) do
+            local name = tostring(b.name or "")
+            if name:find("_ore", 1, true) then
+                local key = normalizeOreName(shortName(name))
+                if WANT_LIST[key] then
+                    return key
+                end
+            end
+        end
+        return nil
+    end
     local solids={}
     for _,b in ipairs(scan) do
         local n=b.name or ""
@@ -1130,6 +1262,7 @@ local function isTool(detail, slot)
     if slot == 1 then return true end   -- slot 1 = scanner, always protected
     if not detail then return false end
     local n = tostring(detail.name or "")
+    if n == SCANNER_ITEM then return true end
     return n:find("pickaxe") ~= nil
 end
 
@@ -1140,7 +1273,7 @@ local function returnAndDump(resumePos)
     if not moveTo({x=dump.x,y=dump.y+1,z=dump.z}) then
         log("DUMP","Could not reach DUMP_CHEST. Parking 10s."); sleep(10); return
     end
-    for i=2,16 do
+    for i=2,15 do
         if turtle.getItemCount(i) > 0 then
             local detail = turtle.getItemDetail(i)
             if isTool(detail, i) then
@@ -1152,7 +1285,7 @@ local function returnAndDump(resumePos)
     end
     turtle.select(1)
     local leftover = false
-    for i=2,16 do
+    for i=2,15 do
         if turtle.getItemCount(i) > 0 and not isTool(turtle.getItemDetail(i), i) then
             leftover = true; break
         end
@@ -1192,10 +1325,20 @@ end
 -- PICKAXE FETCH FROM BASE_CHEST
 -- ============================================================
 local function fetchPickaxeFromBase(resumePos)
-    if not base then log("PICK","No BASE_CHEST set. Halting."); while true do sleep(5) end end
+    if not base then
+        log("PICK","No BASE_CHEST set. Cannot fetch pickaxe.")
+        if server_id then
+            pcall(rednet.send, server_id, {type="ALERT", hwid=hwid, msg="NO_BASE_CHEST_FOR_PICK", pos=copy(pos)}, PROTOCOL)
+        end
+        return false
+    end
     log("PICK","Heading to BASE_CHEST for a pickaxe...")
     if not moveTo({x=base.x,y=base.y+1,z=base.z}) then
-        log("PICK","Cannot reach BASE_CHEST."); while true do sleep(5) end
+        log("PICK","Cannot reach BASE_CHEST.")
+        if server_id then
+            pcall(rednet.send, server_id, {type="ALERT", hwid=hwid, msg="BASE_CHEST_UNREACHABLE", pos=copy(pos)}, PROTOCOL)
+        end
+        return false
     end
 
     local function tryFetch()
@@ -1243,13 +1386,26 @@ local function fetchPickaxeFromBase(resumePos)
         return false
     end
 
-    local fetched=tryFetch()
+    local fetched = tryFetch()
     if not fetched then
-        log("PICK","No usable pickaxe in BASE_CHEST.")
-        log("PICK","Add a FRESH, UNDAMAGED, UNENCHANTED diamond pickaxe. Retrying every 10s...")
-        while not fetched do sleep(10); fetched=tryFetch() end
+        local retries = 0
+        local max_retries = 12  -- 2 minutes at 10s each
+        log("PICK","No pickaxe available in BASE_CHEST. Retrying up to 2 minutes...")
+        while not fetched and retries < max_retries do
+            sleep(10)
+            retries = retries + 1
+            fetched = tryFetch()
+        end
     end
+
+    if not fetched then
+        log("PICK","Timed out waiting for pickaxe at BASE_CHEST.")
+        if resumePos then moveTo(resumePos); face(my_dir) end
+        return false
+    end
+
     if resumePos then moveTo(resumePos); face(my_dir) end
+    return true
 end
 
 -- ============================================================
@@ -1261,12 +1417,23 @@ local function wakeUp()
     log("WAKE","After burn. Fuel = "..tostring(turtle.getFuelLevel()))
     if fuelLevel()==0 then
         log("WAKE","EMPTY. Drop coal in slots 2-15 (slot 1 reserved for scanner)...")
-        while fuelLevel()==0 do burnAboard(FUEL_TARGET); sleep(2) end
+        local retries = 0
+        local max_retries = 30  -- 60 seconds
+        while fuelLevel()==0 and retries < max_retries do
+            burnAboard(FUEL_TARGET)
+            sleep(2)
+            retries = retries + 1
+        end
+        if fuelLevel()==0 then
+            log("WAKE","No fuel received after 60s. Continuing in passive mode.")
+            return false
+        end
         log("WAKE","Got fuel = "..tostring(turtle.getFuelLevel()))
     end
     if fuelLevel()<FUEL_TARGET then
         log("WAKE","Below target. Will forage after calibration.")
     else log("WAKE","Fuel target reached.") end
+    return true
 end
 
 local function forageForCoal()
@@ -1336,7 +1503,9 @@ end
 
 local function handshake()
     log("AUTH",string.format("Broadcasting pos (%d,%d,%d)...",pos.x,pos.y,pos.z))
-    while not server_id do
+    local attempts = 0
+    local max_attempts = 24  -- 2 minutes at 5s timeouts
+    while not server_id and attempts < max_attempts do
         rednet.broadcast({type="AUTH_REQ",hwid=hwid,pos=copy(pos)},PROTOCOL)
         local sender,msg=rednet.receive(PROTOCOL,5)
         if sender and type(msg)=="table" and msg.type=="AUTH_ACK" and msg.hwid==hwid then
@@ -1345,6 +1514,7 @@ local function handshake()
             lane_offset  = msg.lane_offset or 0
             dump         = msg.dump
             base         = msg.base
+            if type(msg.want) == "table" then WANT_LIST = msg.want end
             park_pos     = msg.park   -- may be nil if no zone set
             if dump then cacheSet(dump.x,dump.y,dump.z,"minecraft:chest") end
             if base then cacheSet(base.x,base.y,base.z,"minecraft:chest") end
@@ -1354,8 +1524,16 @@ local function handshake()
                 park_pos and string.format("(%d,%d,%d)",park_pos.x,park_pos.y,park_pos.z) or "none",
                 server_id))
             log("AUTH","Awaiting CMD_START from Overseer.")
-        else log("AUTH","No reply. Retrying...") end
+        else
+            attempts = attempts + 1
+            log("AUTH","No reply. Retrying...")
+        end
     end
+    if not server_id then
+        log("AUTH","No overseer after 2 minutes. Entering passive retry mode.")
+        return false
+    end
+    return true
 end
 
 -- ============================================================
@@ -1457,6 +1635,24 @@ local function state_MINING()
     if fuelLevel() <= 0 then log("FUEL","Zero fuel. Halting."); sleep(10); return "MINING" end
     if inventoryFull()  then return "RTB_DUMP" end
 
+    -- Proactive targeted probe mode:
+    -- If we're heading into unknown space, scan before stepping so
+    -- wanted ores can be dispatched immediately instead of waiting for
+    -- cadence-only scans.
+    probe_ticks = probe_ticks + 1
+    if HW.has_scanner and not scanning_now and probe_ticks >= 2 and hasUnknownAhead() then
+        probe_ticks = 0
+        local snap = scanAround()
+        if snap and #snap > 0 then
+            reportOres(snap)
+            sendSnapshot(snap)
+            local wanted = scanForWanted(snap)
+            if wanted then
+                log("PROBE","Wanted ore seen in pre-step probe: "..wanted)
+            end
+        end
+    end
+
     -- Phase 4A: move into assigned lane on first activation
     if not lane_positioned and lane_offset > 0 then
         log("LANE", string.format("Moving to lane offset +%d...", lane_offset))
@@ -1545,7 +1741,7 @@ local function state_RTB_DUMP()
     end
 
     if moveTo({x=dump.x, y=dump.y+1, z=dump.z}) then
-        for i=2,16 do
+        for i=2,15 do
             if turtle.getItemCount(i) > 0 then
                 local detail = turtle.getItemDetail(i)
                 if isTool(detail, i) then
@@ -1558,7 +1754,7 @@ local function state_RTB_DUMP()
         turtle.select(1)
 
         local leftover = false
-        for i=2,16 do
+        for i=2,15 do
             if turtle.getItemCount(i)>0 and not isTool(turtle.getItemDetail(i), i) then
                 leftover=true; break
             end
@@ -1568,6 +1764,9 @@ local function state_RTB_DUMP()
             pcall(rednet.send, server_id,
                 {type="ALERT",hwid=hwid,msg="CHEST_FULL",pos=copy(pos)}, PROTOCOL)
             sleep(10)
+            -- Prevent RTB_DUMP <-> MINING thrash when chest is full.
+            started = false
+            return "PARKED"
         else
             refuelSelf()
             log("DUMP","Emptied successfully.")
@@ -1586,7 +1785,18 @@ local function state_RTB_FUEL()
     if not base then
         log("FUEL","No BASE_CHEST set. Cannot refuel. Halting 10s.")
         sleep(10)
-        return "MINING"
+        fuel_retry_streak = fuel_retry_streak + 1
+        if fuel_retry_streak >= 6 then
+            log("FUEL","No BASE_CHEST persists. Parking to avoid deadlock.")
+            started = false
+            if server_id then
+                pcall(rednet.send, server_id, {
+                    type="ALERT", hwid=hwid, msg="RTB_FUEL_NO_BASE", pos=copy(pos)
+                }, PROTOCOL)
+            end
+            return "PARKED"
+        end
+        return "RTB_FUEL"
     end
     local resume = copy(pos)
     log("FUEL","Critical fuel. Heading to BASE_CHEST...")
@@ -1610,16 +1820,30 @@ local function state_RTB_FUEL()
         log("FUEL","Refuelled. Fuel = "..tostring(turtle.getFuelLevel()))
         moveTo(resume)
         face(my_dir)
+        fuel_retry_streak = 0
     else
         log("FUEL","Could not reach BASE_CHEST. Parking 10s.")
         sleep(10)
+        fuel_retry_streak = fuel_retry_streak + 1
     end
 
     -- Recheck: if still critical after the trip, go back rather than mining dry
     if fuelLevel() < FUEL_CRITICAL then
         log("FUEL","Still critical after refuel attempt. Retrying.")
+        fuel_retry_streak = fuel_retry_streak + 1
+        if fuel_retry_streak >= 6 then
+            log("FUEL","Retry limit reached. Parking to avoid deadlock.")
+            started = false
+            if server_id then
+                pcall(rednet.send, server_id, {
+                    type="ALERT", hwid=hwid, msg="RTB_FUEL_STALLED", pos=copy(pos)
+                }, PROTOCOL)
+            end
+            return "PARKED"
+        end
         return "RTB_FUEL"
     end
+    fuel_retry_streak = 0
     return "MINING"
 end
 
@@ -1825,19 +2049,28 @@ end
 local function heartbeatThread_inner()
     local scan_ticker = 0
     while true do
-        -- Send state name so the overseer cockpit shows full state
-        pcall(rednet.send, server_id, {
-            type   = "HEARTBEAT",
-            hwid   = hwid,
-            fuel   = turtle.getFuelLevel(),
-            pos    = copy(pos),
-            free   = freeSlots(),
-            status = current_state,   -- full state name, not just MINING/STANDBY
-        }, PROTOCOL)
+        if server_id then
+            -- Send state name so the overseer cockpit shows full state
+            pcall(rednet.send, server_id, {
+                type   = "HEARTBEAT",
+                hwid   = hwid,
+                fuel   = turtle.getFuelLevel(),
+                pos    = copy(pos),
+                free   = freeSlots(),
+                status = current_state,
+            }, PROTOCOL)
+        else
+            -- Passive re-enlist if boot handshake timed out.
+            pcall(rednet.broadcast, {
+                type = "AUTH_REQ",
+                hwid = hwid,
+                pos  = copy(pos),
+                fuel = turtle.getFuelLevel(),
+            }, PROTOCOL)
+        end
 
         scan_ticker = scan_ticker + 1
-        if scan_ticker >= 5 and HW.has_scanner
-        and not peripheral.isPresent(HW.pick_side) then
+        if scan_ticker >= 5 and HW.has_scanner and not scanning_now then
             scan_ticker = 0
             local snap = scanAround()
             if snap and #snap > 0 then reportOres(snap); sendSnapshot(snap) end
@@ -1858,6 +2091,7 @@ local function listenerThread_inner()
             elseif msg.type=="CONFIG" then
                 if msg.dump then dump=msg.dump; cacheSet(dump.x,dump.y,dump.z,"minecraft:chest") end
                 if msg.base then base=msg.base; cacheSet(base.x,base.y,base.z,"minecraft:chest") end
+                                if type(msg.want)=="table" then WANT_LIST=msg.want end
                 if msg.direction   then my_dir=msg.direction end
                 if msg.park ~= nil then
                     park_pos = msg.park
@@ -1873,6 +2107,27 @@ local function listenerThread_inner()
             elseif msg.type=="GOTO" and msg.hwid==hwid and type(msg.pos)=="table" then
                 log("GOTO","Job queued: "..(msg.ore or "ore"))
                 table.insert(jobs, msg)
+
+            elseif msg.type=="AUTH_ACK" and msg.hwid==hwid then
+                server_id    = sender
+                my_dir       = msg.direction   or my_dir
+                lane_offset  = msg.lane_offset or lane_offset
+                dump         = msg.dump or dump
+                base         = msg.base or base
+                                if type(msg.want)=="table" then WANT_LIST=msg.want end
+                park_pos     = msg.park or park_pos
+                if dump then cacheSet(dump.x,dump.y,dump.z,"minecraft:chest") end
+                if base then cacheSet(base.x,base.y,base.z,"minecraft:chest") end
+                face(my_dir)
+                log("AUTH", string.format("Late AUTH_ACK accepted. Server=%d dir=%d lane=+%d",
+                    server_id, my_dir, lane_offset))
+
+            elseif msg.type=="RESERVE_ACK" and msg.hwid==hwid then
+                local nonce = tonumber(msg.nonce)
+                if nonce and reservation_pending[nonce] then
+                    reservation_pending[nonce].done = true
+                    reservation_pending[nonce].granted = (msg.granted == true)
+                end
 
             -- O-NET V1: PUSH protocol (Overmind pushCreep equivalent).
             -- PUSH_REQ is broadcast by any turtle that is stuck.
@@ -1984,11 +2239,18 @@ log("INIT","HWID: "..hwid)
 
 detectHardware()   -- 1. find everything, touch nothing
 openModem()        -- 2. open rednet on detected modem
-wakeUp()           -- 3. burn aboard fuel, wait if empty
+local woke = wakeUp()   -- 3. burn aboard fuel, wait if empty
 calibrate()        -- 4. restore from disk or GPS-derive heading
-handshake()        -- 5. enlist, get base+dump coords
+local authed = handshake() -- 5. enlist, get base+dump coords
 bootEquipPickaxe() -- 6. equip pickaxe now that we can navigate
 forageForCoal()    -- 7. mine coal if still below target
+
+if not woke then
+    log("BOOT","Fuel bootstrap timed out. Waiting for manual fuel or base refuel cycle.")
+end
+if not authed then
+    log("BOOT","Running in passive auth retry mode until overseer responds.")
+end
 
 log("BOOT",string.format(
     "Ready. Pickaxe=%s Scanner=%s (slot %s) Fuel=%s Pos=(%d,%d,%d) Facing=%s",
