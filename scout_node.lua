@@ -129,6 +129,11 @@ local function copy(p) return { x=p.x, y=p.y, z=p.z } end
 local function key(p)  return p.x..":"..p.y..":"..p.z end
 local function shortName(n) return (n:match(":(.+)") or n) end
 
+local function isScannerName(name)
+    local n = tostring(name or "")
+    return n == SCANNER_ITEM or n:find("geo_scanner", 1, true) ~= nil
+end
+
 local function noteRecentTile(p)
     if type(p) ~= "table" then return end
     recent_tiles[recent_tile_index] = { x = p.x, y = p.y, z = p.z }
@@ -247,7 +252,7 @@ local function detectHardware()
         local detail = turtle.getItemDetail(s)
         if detail then
             local name = tostring(detail.name or "")
-            if name == SCANNER_ITEM then
+            if isScannerName(name) then
                 HW.scanner_slot = s
                 HW.has_scanner  = true
                 if s == 1 then
@@ -341,6 +346,12 @@ local function isPassable(name)
     return name == nil or name == "" or name:find("air") ~= nil
 end
 
+local function isScanNoise(name)
+    local n = tostring(name or "")
+    -- Ignore dynamic turtle entities in scan data so they don't pollute map/cache.
+    return n:find("turtle", 1, true) ~= nil
+end
+
 -- ============================================================
 -- WORLD CACHE
 -- ============================================================
@@ -358,10 +369,12 @@ local function feedCache(scan, origin)
     if type(scan) ~= "table" or type(origin) ~= "table" then return end
     for _, b in ipairs(scan) do
         if type(b) == "table" and type(b.name) == "string" then
+            if not isScanNoise(b.name) then
             cacheSet(
                 math.floor(origin.x+(b.x or 0)),
                 math.floor(origin.y+(b.y or 0)),
                 math.floor(origin.z+(b.z or 0)), b.name)
+            end
         end
     end
 end
@@ -1147,7 +1160,7 @@ scanAround = function()
             -- Re-search for the scanner in case it moved
             for s=1,16 do
                 local d=turtle.getItemDetail(s)
-                if d and tostring(d.name or "")==SCANNER_ITEM then
+                if d and isScannerName(d.name) then
                     HW.scanner_slot=s; break
                 end
             end
@@ -1180,7 +1193,7 @@ scanAround = function()
     -- Update scanner slot in case the swap moved it
     for s=1,16 do
         local d=turtle.getItemDetail(s)
-        if d and tostring(d.name or "")==SCANNER_ITEM then HW.scanner_slot=s; break end
+        if d and isScannerName(d.name) then HW.scanner_slot=s; break end
     end
 
     if not pickaxeEquipped() then log("WARN","Pickaxe not restored after scan swap.") end
@@ -1215,34 +1228,36 @@ local function reportOres(scan)
     end
 end
 
-local function sendSnapshot(scan)
+local function hasUnknownAhead()
+    local dv = DIRV[facing]
+    local fx = pos.x + dv.dx
+    local fz = pos.z + dv.dz
+    -- Probe trigger: any unknown in the immediate forward tunnel prism.
+    return cacheGet(fx, pos.y,   fz) == nil
+        or cacheGet(fx, pos.y+1, fz) == nil
+        or cacheGet(fx, pos.y-1, fz) == nil
+end
 
-    local function hasUnknownAhead()
-        local dv = DIRV[facing]
-        local fx = pos.x + dv.dx
-        local fz = pos.z + dv.dz
-        -- Probe trigger: any unknown in the immediate forward tunnel prism.
-        return cacheGet(fx, pos.y,   fz) == nil
-            or cacheGet(fx, pos.y+1, fz) == nil
-            or cacheGet(fx, pos.y-1, fz) == nil
-    end
-
-    local function scanForWanted(scan)
-        for _, b in ipairs(scan or {}) do
-            local name = tostring(b.name or "")
-            if name:find("_ore", 1, true) then
-                local key = normalizeOreName(shortName(name))
-                if WANT_LIST[key] then
-                    return key
-                end
+local function scanForWanted(scan)
+    for _, b in ipairs(scan or {}) do
+        local name = tostring(b.name or "")
+        if name:find("_ore", 1, true) then
+            local key = normalizeOreName(shortName(name))
+            if WANT_LIST[key] then
+                return key
             end
         end
-        return nil
     end
+    return nil
+end
+
+local function sendSnapshot(scan)
     local solids={}
     for _,b in ipairs(scan) do
         local n=b.name or ""
-        if n~="" and not n:find("air") then solids[#solids+1]={x=b.x,y=b.y,z=b.z,name=n} end
+        if n~="" and not n:find("air") and not isScanNoise(n) then
+            solids[#solids+1]={x=b.x,y=b.y,z=b.z,name=n}
+        end
     end
     pcall(rednet.send,server_id,{
         type="GEO_DATA", hwid=hwid, pos=copy(pos),
@@ -1253,6 +1268,18 @@ end
 -- ============================================================
 -- DUMP LOOT
 -- ============================================================
+local function refreshScannerSlot()
+    for s=1,16 do
+        local d = turtle.getItemDetail(s)
+        if d and isScannerName(d.name) then
+            HW.scanner_slot = s
+            HW.has_scanner = true
+            return s
+        end
+    end
+    return nil
+end
+
 -- Items that must NEVER be dropped into the dump chest.
 -- Checked by name fragment so "diamond_pickaxe" and
 -- "advancedperipherals:geo_scanner" are both caught.
@@ -1261,14 +1288,22 @@ end
 -- Neither is ever dropped regardless of NBT or getItemDetail quirks.
 local function isTool(detail, slot)
     if slot == 1 then return true end   -- slot 1 = scanner, always protected
-    if not detail then return false end
+    if HW.scanner_slot and slot == HW.scanner_slot and turtle.getItemCount(slot) > 0 then
+        return true
+    end
+    if not detail then
+        -- Fail-safe: never dump an unknown-detail stack.
+        -- This prevents scanner loss when getItemDetail intermittently returns nil.
+        return turtle.getItemCount(slot) > 0
+    end
     local n = tostring(detail.name or "")
-    if n == SCANNER_ITEM then return true end
+    if isScannerName(n) then return true end
     return n:find("pickaxe") ~= nil
 end
 
 local function returnAndDump(resumePos)
     log("DUMP","Cargo full. Heading to DUMP_CHEST...")
+    refreshScannerSlot()
     refuelSelf()
     if not dump then log("DUMP","No dump chest set."); return end
     if not moveTo({x=dump.x,y=dump.y+1,z=dump.z}) then
@@ -1278,7 +1313,7 @@ local function returnAndDump(resumePos)
         if turtle.getItemCount(i) > 0 then
             local detail = turtle.getItemDetail(i)
             if isTool(detail, i) then
-                log("DUMP","Keeping tool in slot "..i..": "..(detail.name or "?"))
+                log("DUMP","Keeping tool in slot "..i..": "..((detail and detail.name) or "?"))
             else
                 turtle.select(i); turtle.dropDown()
             end
@@ -1296,6 +1331,31 @@ local function returnAndDump(resumePos)
         pcall(rednet.send,server_id,{type="ALERT",hwid=hwid,msg="CHEST_FULL",pos=copy(pos)},PROTOCOL)
         sleep(10); return
     end
+
+    -- Hard guard: after a successful dump, vacate the chest tile so
+    -- other turtles can access it and parking logic doesn't stall there.
+    if dump and pos.x == dump.x and pos.y == (dump.y + 1) and pos.z == dump.z then
+        local y = dump.y + 1
+        local candidates = {
+            {x=dump.x+1, y=y, z=dump.z},
+            {x=dump.x-1, y=y, z=dump.z},
+            {x=dump.x,   y=y, z=dump.z+1},
+            {x=dump.x,   y=y, z=dump.z-1},
+            {x=dump.x,   y=y+1, z=dump.z},
+        }
+        local moved_off = false
+        for _, c in ipairs(candidates) do
+            if moveTo(c) then
+                moved_off = true
+                log("DUMP", string.format("Moved off dump tile to (%d,%d,%d).", c.x, c.y, c.z))
+                break
+            end
+        end
+        if not moved_off then
+            log("DUMP", "Could not move off dump tile after unload.")
+        end
+    end
+
     refuelSelf(); log("DUMP","Emptied.")
     if resumePos then moveTo(resumePos); face(my_dir) end
 end
@@ -1306,6 +1366,7 @@ end
 local function grabFuelFromBase()
     if not base then return end
     local resume=copy(pos); log("FUEL","Critical. Heading to BASE_CHEST...")
+    refreshScannerSlot()
     if not moveTo({x=base.x,y=base.y+1,z=base.z}) then log("FUEL","Cannot reach base."); sleep(10); return end
     -- Slot 1 is reserved for the scanner. Pull coal into slots 2-15 only.
     for s=2,15 do if turtle.getItemCount(s)==0 then turtle.select(s); if not turtle.suckDown(64) then break end end end
@@ -1462,7 +1523,7 @@ local function bootEquipPickaxe()
             if turtle.getItemCount(s)==0 then
                 turtle.select(s); equipOnPickaxeSide()
                 local got=turtle.getItemDetail(s)
-                if got and tostring(got.name or "")==SCANNER_ITEM then HW.scanner_slot=s end
+                if got and isScannerName(got.name) then HW.scanner_slot=s end
                 log("INIT","Cleared "..HW.pick_side.." slot -> inventory slot "..s)
                 break
             end
@@ -1481,7 +1542,7 @@ local function bootEquipPickaxe()
                     log("INIT","Equipping pickaxe from slot "..s.." onto "..HW.pick_side.."...")
                     turtle.select(s); equipOnPickaxeSide()
                     local swapped=turtle.getItemDetail(s)
-                    if swapped and tostring(swapped.name or "")==SCANNER_ITEM then HW.scanner_slot=s end
+                    if swapped and isScannerName(swapped.name) then HW.scanner_slot=s end
                     if pickaxeEquipped() then log("INIT","Pickaxe equipped. OK"); turtle.select(2); return true end
                 end
             end
@@ -1590,8 +1651,17 @@ local function state_STANDBY()
                    + math.abs(pos.z-park_pos.z)
         if dist > 0 then
             log("PARK","Moving to park slot ("..park_pos.x..","..park_pos.y..","..park_pos.z..")...")
-            moveTo(park_pos)
-            log("PARK","At park slot. Waiting for start.")
+            local ok = moveTo(park_pos)
+            if ok then
+                log("PARK","At park slot. Waiting for start.")
+            else
+                log("PARK","Could not reach park slot from standby.")
+                if server_id then
+                    pcall(rednet.send, server_id, {
+                        type="ALERT", hwid=hwid, msg="PARK_BLOCKED", pos=copy(pos)
+                    }, PROTOCOL)
+                end
+            end
         end
     end
     sleep(0.5)
@@ -1606,8 +1676,17 @@ local function state_PARKED()
                    + math.abs(pos.z-park_pos.z)
         if dist > 0 then
             log("PARK","Navigating to park slot ("..park_pos.x..","..park_pos.y..","..park_pos.z..")...")
-            moveTo(park_pos)
-            log("PARK","Parked. Awaiting CMD_START.")
+            local ok = moveTo(park_pos)
+            if ok then
+                log("PARK","Parked. Awaiting CMD_START.")
+            else
+                log("PARK","Could not reach park slot; remaining at current position.")
+                if server_id then
+                    pcall(rednet.send, server_id, {
+                        type="ALERT", hwid=hwid, msg="PARK_BLOCKED", pos=copy(pos)
+                    }, PROTOCOL)
+                end
+            end
         end
     end
     if started then
@@ -1735,6 +1814,7 @@ end
 -- ── RTB_DUMP ─────────────────────────────────────────────
 local function state_RTB_DUMP()
     log("DUMP","Cargo full or recalled. Heading to DUMP_CHEST...")
+    refreshScannerSlot()
     refuelSelf()
     if not dump then
         log("DUMP","No dump chest set. Parking.")
@@ -1771,6 +1851,29 @@ local function state_RTB_DUMP()
         else
             refuelSelf()
             log("DUMP","Emptied successfully.")
+
+            -- Hard guard: move off chest tile after successful unload.
+            if dump and pos.x == dump.x and pos.y == (dump.y + 1) and pos.z == dump.z then
+                local y = dump.y + 1
+                local candidates = {
+                    {x=dump.x+1, y=y, z=dump.z},
+                    {x=dump.x-1, y=y, z=dump.z},
+                    {x=dump.x,   y=y, z=dump.z+1},
+                    {x=dump.x,   y=y, z=dump.z-1},
+                    {x=dump.x,   y=y+1, z=dump.z},
+                }
+                local moved_off = false
+                for _, c in ipairs(candidates) do
+                    if moveTo(c) then
+                        moved_off = true
+                        log("DUMP", string.format("Moved off dump tile to (%d,%d,%d).", c.x, c.y, c.z))
+                        break
+                    end
+                end
+                if not moved_off then
+                    log("DUMP", "Could not move off dump tile after unload.")
+                end
+            end
         end
     else
         log("DUMP","Could not reach DUMP_CHEST. Parking 10s.")
