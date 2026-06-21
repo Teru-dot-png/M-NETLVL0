@@ -1,17 +1,48 @@
 --[[
-    M-NET V3 | MINER NODE  (Phase 1-5)
-    ====================================
+    M-NET V3 | MINER NODE  (Phase 1-5 + post-launch fixes)
+    =========================================================
     Hardware (auto-detected at boot by detectHardware()):
-        Any side  : Ender Modem      (comms; side found at runtime)
-        Other side: Diamond Pickaxe  (hot-swapped with scanner)
+        Any side  : Ender Modem       (comms; side found at runtime)
+        Other side: Diamond Pickaxe   (hot-swapped with scanner during scans)
         Any slot  : advancedperipherals:geo_scanner (slot found at runtime)
         Any slot  : Coal or other fuel (self-sustaining after boot)
 
-    Phase 1  Hardened boot: detectHardware, persistent calibration, pcall restarts.
-    Phase 2  State machine: STANDBY/MINING/RTB_DUMP/RTB_FUEL/FETCH_PICK/GOTO/PARKED.
-    Phase 3  Nav reliability: GPS resync every 16 steps, spiral recovery, waypoints.
-    Phase 4  Tunnel strategy: lane offsets, 1-wide 2-tall tunnels, exhausted zones.
-    Phase 5  Intelligence: passive scans feed overseer map during standby + nav.
+    Phase 1  Hardened boot: detectHardware() scans all 16 slots + both
+             peripheral sides by exact item name before touching anything.
+             Calibration saved to mnet_cal.cfg; restored on reboot inside a
+             tunnel so the one-step GPS move is skipped. All three threads
+             restart themselves via pcall loops on any internal crash.
+
+    Phase 2  State machine brain: STANDBY -> MINING -> RTB_DUMP -> RTB_FUEL
+             -> FETCH_PICK -> GOTO -> PARKED. Every transition logged and
+             broadcast to the overseer as the full state name.
+
+    Phase 3  Nav reliability: greedy axis navigator inspects before moving.
+             GPS re-sync every 16 steps corrects dead-reckoning drift.
+             Recovery spiral tries all 6 directions when stuck. Journeys
+             over 32 blocks split into waypoints for fresh re-evaluation.
+
+    Phase 4  Tunnel strategy: overseer assigns perpendicular lane offsets so
+             multiple turtles mine parallel corridors 4 blocks apart. Cuts a
+             1-wide 2-tall tunnel so the return path always has headroom.
+
+    Phase 5  Intelligence: passive geo-scan every 5 heartbeats feeds the
+             overseer map even during standby. Every forward() move sends a
+             single-block air update so the overseer map shows the tunnel
+             carving out in real time as it is dug.
+
+    Post-launch fixes:
+        - navCost: unknown=4, air=1, stone=8 so the navigator strongly
+          prefers the already-dug tunnel over boring through fresh rock.
+        - forward() marks every entered block as air in the local cache AND
+          broadcasts it to the overseer, so both the local nav and the
+          remote map stay accurate block-by-block.
+        - scanning_now lock prevents a race between the heartbeat passive
+          scan (scanner on pick_side) and the brain's pickaxeEquipped()
+          check, which was causing the FETCH_PICK loop.
+        - isEquippable() no longer rejects pickaxes with Forge tag NBT
+          (shown as "(alt)" in tooltips). Only actual damage or enchantments
+          block equip, matching CC:Tweaked's real restriction.
 
     Boot order:
         1. detectHardware()    find everything, touch nothing
@@ -386,28 +417,66 @@ local function stepDown()
     return false
 end
 
+-- TUNNEL FORWARD (used during mining, not navigation).
+-- Digs any non-lava block. On success:
+--   1. Marks the entered block as "air" in the local world cache so the
+--      return-trip navigator knows the tunnel is clear.
+--   2. Sends a single-block GEO_DATA("air") to the overseer so the map
+--      shows the tunnel carving out in real time.
+-- These two steps are what prevent the "walks through its own wall" bug.
 local function forward()
     liveInspect()
     if isLavaAhead() then log("MINE","Lava ahead. Skipping."); return false end
-    if turtle.forward() then pos.x=pos.x+DIRV[facing].dx; pos.z=pos.z+DIRV[facing].dz; return true end
+    if turtle.forward() then
+        local nx = pos.x+DIRV[facing].dx
+        local nz = pos.z+DIRV[facing].dz
+        cacheSet(nx, pos.y, nz, "air")
+        pos.x = nx; pos.z = nz
+        -- Tell overseer this block is now air so the map updates live
+        pcall(rednet.send, server_id, {
+            type="GEO_DATA", hwid=hwid, pos=copy(pos),
+            scan_data={{ x=0, y=0, z=0, name="minecraft:air" }},
+        }, PROTOCOL)
+        return true
+    end
     if not turtle.detect() then return false end
     for i=1,64 do
         if not turtle.dig() then turtle.attack() end
-        if turtle.forward() then pos.x=pos.x+DIRV[facing].dx; pos.z=pos.z+DIRV[facing].dz; return true end
+        if turtle.forward() then
+            local nx = pos.x+DIRV[facing].dx
+            local nz = pos.z+DIRV[facing].dz
+            cacheSet(nx, pos.y, nz, "air")
+            pos.x = nx; pos.z = nz
+            pcall(rednet.send, server_id, {
+                type="GEO_DATA", hwid=hwid, pos=copy(pos),
+                scan_data={{ x=0, y=0, z=0, name="minecraft:air" }},
+            }, PROTOCOL)
+            return true
+        end
         sleep(0.15)
     end
     return false
 end
 
 -- ============================================================
--- NAVIGATION  (Phase 3: reliable greedy + GPS resync + spiral recovery + waypoints)
+-- NAVIGATION  (Phase 3 + post-launch fixes)
+-- Greedy axis navigator with GPS resync, spiral recovery, and
+-- waypoint splitting. navCost strongly favours known-air (dug
+-- tunnels) over unknown or known-solid space so the turtle
+-- always walks back through its own corridor rather than trying
+-- to mine a new path through stone.
+-- Every forward() move writes "air" into the local cache AND
+-- broadcasts a single-block GEO_DATA to the overseer so both
+-- the local nav and the remote map stay current block-by-block.
 -- ============================================================
 local function navCost(nx,ny,nz)
+    -- unknown=4, air=1, stone=8: dug tunnel costs 1/4 of unknown space
+    -- and 1/8 of known stone, so the navigator always takes it.
     local name = cacheGet(nx,ny,nz)
-    if name==nil        then return 1 end   -- unknown: optimistic, treat as air
-    if isPassable(name) then return 1 end
-    if isDiggable(name) then return 3 end
-    return nil                              -- protected/fluid: impassable
+    if name==nil        then return 4  end   -- unknown: assume solid
+    if isPassable(name) then return 1  end   -- known air: strongly prefer
+    if isDiggable(name) then return 8  end   -- known stone: last resort
+    return nil                               -- protected/fluid: impassable
 end
 
 -- ── Min-heap ─────────────────────────────────────────────
@@ -1187,11 +1256,19 @@ local function state_MINING()
             if not isPassable(name_up) then
                 if isDiggable(name_up) then
                     turtle.digUp()
+                    cacheSet(pos.x, pos.y+1, pos.z, "air")
+                    -- Report air above to overseer so map clears
+                    pcall(rednet.send, server_id, {
+                        type="GEO_DATA", hwid=hwid, pos=copy(pos),
+                        scan_data={{ x=0, y=1, z=0, name="minecraft:air" }},
+                    }, PROTOCOL)
                 else
-                    -- Protected block above — duck and flag but keep going
                     log("MINE","Protected block above ["..name_up.."]. Leaving it.")
                 end
             end
+        else
+            -- Nothing above = already air, mark it so nav knows
+            cacheSet(pos.x, pos.y+1, pos.z, "air")
         end
 
         if tunnelled % 8 == 0 then
