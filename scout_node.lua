@@ -178,15 +178,22 @@ local function detectHardware()
         end
     end
 
-    -- Scan all 16 inventory slots by exact name
+    -- Scan all 16 inventory slots by exact name.
+    -- SLOT 1 IS RESERVED for the geo scanner. If found elsewhere, move it.
     for s = 1, 16 do
         local detail = turtle.getItemDetail(s)
         if detail then
             local name = tostring(detail.name or "")
             if name == SCANNER_ITEM then
-                HW.scanner_slot = s
+                if s ~= 1 then
+                    -- Move scanner to slot 1
+                    log("HW", "Moving Geo Scanner from slot "..s.." -> slot 1 (reserved).")
+                    turtle.select(s)
+                    turtle.transferTo(1)
+                end
+                HW.scanner_slot = 1
                 HW.has_scanner  = true
-                log("HW", "Geo Scanner: slot " .. s)
+                log("HW", "Geo Scanner: slot 1 (reserved).")
             elseif name:find("pickaxe") then
                 if not HW.has_pickaxe then
                     log("HW", "Pickaxe item: slot " .. s .. " (" .. name .. ")")
@@ -212,12 +219,13 @@ local function fuelLevel()
 end
 
 local function burnAboard(target)
-    for slot = 1, 15 do
+    -- Slot 1 is reserved for the geo scanner. Start from slot 2.
+    for slot = 2, 15 do
         if fuelLevel() >= target then break end
         turtle.select(slot)
         if turtle.refuel(0) then turtle.refuel() end
     end
-    turtle.select(1)
+    turtle.select(2)
 end
 
 local function refuelSelf()
@@ -1020,11 +1028,11 @@ end
 -- INVENTORY
 -- ============================================================
 local function inventoryFull()
-    for i=1,15 do if turtle.getItemCount(i)==0 then return false end end
+    for i=2,15 do if turtle.getItemCount(i)==0 then return false end end
     return true
 end
 local function freeSlots()
-    local n=0; for i=1,15 do if turtle.getItemCount(i)==0 then n=n+1 end end; return n
+    local n=0; for i=2,15 do if turtle.getItemCount(i)==0 then n=n+1 end end; return n
 end
 
 -- ============================================================
@@ -1061,20 +1069,14 @@ end
 -- Items that must NEVER be dropped into the dump chest.
 -- Checked by name fragment so "diamond_pickaxe" and
 -- "advancedperipherals:geo_scanner" are both caught.
--- Items that must NEVER be dropped into the dump chest or thrown
--- away during fuel grab. Matched by name fragment AND by checking
--- against the known scanner slot from the HW map.
+-- Slot 1 is permanently reserved for the geo scanner.
+-- Pickaxe is protected by name match.
+-- Neither is ever dropped regardless of NBT or getItemDetail quirks.
 local function isTool(detail, slot)
+    if slot == 1 then return true end   -- slot 1 = scanner, always protected
     if not detail then return false end
     local n = tostring(detail.name or "")
-    -- Match pickaxe or geo scanner by name
-    if n:find("pickaxe")    ~= nil then return true end
-    if n:find("geo_scanner") ~= nil then return true end
-    -- Also protect by exact item name for belt-and-suspenders safety
-    if n == SCANNER_ITEM then return true end
-    -- Also protect the known scanner slot regardless of what name returns
-    if slot and HW.scanner_slot and slot == HW.scanner_slot then return true end
-    return false
+    return n:find("pickaxe") ~= nil
 end
 
 local function returnAndDump(resumePos)
@@ -1084,7 +1086,7 @@ local function returnAndDump(resumePos)
     if not moveTo({x=dump.x,y=dump.y+1,z=dump.z}) then
         log("DUMP","Could not reach DUMP_CHEST. Parking 10s."); sleep(10); return
     end
-    for i=1,16 do
+    for i=2,16 do
         if turtle.getItemCount(i) > 0 then
             local detail = turtle.getItemDetail(i)
             if isTool(detail, i) then
@@ -1096,7 +1098,7 @@ local function returnAndDump(resumePos)
     end
     turtle.select(1)
     local leftover = false
-    for i=1,16 do
+    for i=2,16 do
         if turtle.getItemCount(i) > 0 and not isTool(turtle.getItemDetail(i), i) then
             leftover = true; break
         end
@@ -1338,23 +1340,35 @@ end
 -- ── STANDBY ──────────────────────────────────────────────
 local function state_STANDBY()
     if started then return "MINING" end
+    -- If a park zone is set and we are not there yet, go park properly
+    if park_pos then
+        local dist = math.abs(pos.x-park_pos.x)
+                   + math.abs(pos.y-park_pos.y)
+                   + math.abs(pos.z-park_pos.z)
+        if dist > 0 then
+            log("PARK","Moving to park slot ("..park_pos.x..","..park_pos.y..","..park_pos.z..")...")
+            moveTo(park_pos)
+            log("PARK","At park slot. Waiting for start.")
+        end
+    end
     sleep(0.5)
     return "STANDBY"
 end
 
 -- ── PARKED ───────────────────────────────────────────────
 local function state_PARKED()
-    -- Navigate to the assigned park slot if one was given by the overseer
+    -- Always navigate to the assigned park slot when entering this state.
+    -- moveTo returns immediately if already there.
     if park_pos then
-        local dist = math.abs(pos.x-park_pos.x)+math.abs(pos.y-park_pos.y)+math.abs(pos.z-park_pos.z)
+        local dist = math.abs(pos.x-park_pos.x)
+                   + math.abs(pos.y-park_pos.y)
+                   + math.abs(pos.z-park_pos.z)
         if dist > 0 then
-            log("PARK", string.format("Navigating to park slot (%d,%d,%d)...",
-                park_pos.x, park_pos.y, park_pos.z))
+            log("PARK","Navigating to park slot ("..park_pos.x..","..park_pos.y..","..park_pos.z..")...")
             moveTo(park_pos)
             log("PARK","Parked. Awaiting CMD_START.")
         end
     end
-
     if started then
         tunnelled = 0
         return "MINING"
@@ -1467,7 +1481,7 @@ local function state_RTB_DUMP()
     end
 
     if moveTo({x=dump.x, y=dump.y+1, z=dump.z}) then
-        for i=1,16 do
+        for i=2,16 do
             if turtle.getItemCount(i) > 0 then
                 local detail = turtle.getItemDetail(i)
                 if isTool(detail, i) then
@@ -1480,7 +1494,7 @@ local function state_RTB_DUMP()
         turtle.select(1)
 
         local leftover = false
-        for i=1,16 do
+        for i=2,16 do
             if turtle.getItemCount(i)>0 and not isTool(turtle.getItemDetail(i), i) then
                 leftover=true; break
             end
