@@ -553,14 +553,47 @@ end
 -- ── PHASE 3A: GPS RESYNC ─────────────────────────────────
 -- Every 16 steps, compare dead-reckoning pos with GPS.
 -- If they disagree by more than 1 block, trust GPS.
+-- GPS position sync: correct dead-reckoning drift.
+-- Called every 8 steps during mining and every 16 steps during navigation.
+-- If pos is off by more than 0 blocks we correct it immediately.
+-- If pos is badly off (>3 blocks) we also re-derive facing from two
+-- consecutive GPS readings, since that level of drift usually means
+-- the heading is wrong, not just accumulated float error.
 local function gpsSyncPos()
-    local x,y,z = gps.locate(1)
+    local x,y,z = gps.locate(2)
     if not x then return end
     local drift = math.abs(x-pos.x)+math.abs(y-pos.y)+math.abs(z-pos.z)
-    if drift > 1 then
-        log("NAV",string.format("GPS resync: drift %d blocks. (%d,%d,%d)->(%d,%d,%d)",
-            drift, pos.x,pos.y,pos.z, x,y,z))
-        pos = {x=x,y=y,z=z}
+    if drift == 0 then return end
+
+    log("NAV",string.format("GPS drift %d. Correcting (%d,%d,%d)->(%d,%d,%d)",
+        drift, pos.x,pos.y,pos.z, x,y,z))
+    pos = {x=x,y=y,z=z}
+
+    if drift > 3 then
+        -- Heading is probably wrong. Re-derive it by attempting one move
+        -- and reading GPS before and after.
+        log("NAV","Large drift detected. Re-deriving heading from GPS...")
+        local moved = false
+        for _=0,3 do
+            if turtle.forward() then moved=true; break end
+            turtle.turnRight()
+        end
+        if moved then
+            local x2,y2,z2 = gps.locate(2)
+            if x2 then
+                local ddx,ddz = x2-x, z2-z
+                if     ddx== 1 then facing=1
+                elseif ddx==-1 then facing=3
+                elseif ddz== 1 then facing=2
+                elseif ddz==-1 then facing=0 end
+                pos = {x=x2,y=y2,z=z2}
+                log("NAV",string.format("Heading re-derived: facing=%d (%s)",
+                    facing,({"N","E","S","W"})[facing+1]))
+                saveCal()
+            end
+        else
+            log("NAV","Could not move to re-derive heading. Will try again next sync.")
+        end
     end
 end
 
@@ -710,8 +743,8 @@ function moveTo(goal)
             elseif result == "moved" then
                 stuck_count      = 0
                 steps_since_sync = steps_since_sync + 1
-                -- Phase 3A: GPS resync every 16 steps
-                if steps_since_sync >= 16 then
+                -- GPS resync every 8 steps during navigation (tighter than before)
+                if steps_since_sync >= 8 then
                     steps_since_sync = 0
                     gpsSyncPos()
                 end
@@ -806,24 +839,55 @@ local function calibrate()
     local p1 = gpsPos()
     if not p1 then error("[FATAL] No GPS fix. Build a GPS constellation first.",0) end
 
-    -- Try restoring from saved calibration
+    -- Try restoring from saved calibration.
+    -- We still verify the heading with one live GPS step because a crashed
+    -- turtle may have saved a heading from before it was pushed or turned.
     local saved = loadCal()
     if saved then
         local saved_dist = math.abs(p1.x-saved.pos.x)+math.abs(p1.y-saved.pos.y)+math.abs(p1.z-saved.pos.z)
         if saved_dist <= 1 then
-            pos    = copy(p1)       -- use GPS for accuracy
+            pos    = copy(p1)
             facing = saved.facing
-            log("NAV",string.format("Restored from disk: facing=%d (%s) pos=(%d,%d,%d)",
+            log("NAV",string.format("Saved cal matches GPS. Verifying heading..."))
+
+            -- Take one step to confirm facing is actually correct.
+            -- This catches the case where the turtle was pushed/rotated after save.
+            local step_ok = turtle.forward()
+            if step_ok then
+                local p2 = gpsPos()
+                if p2 then
+                    local ddx,ddz = p2.x-p1.x, p2.z-p1.z
+                    local derived
+                    if     ddx== 1 then derived=1
+                    elseif ddx==-1 then derived=3
+                    elseif ddz== 1 then derived=2
+                    elseif ddz==-1 then derived=0 end
+                    if derived ~= nil and derived ~= facing then
+                        log("NAV",string.format(
+                            "Heading mismatch! Saved=%d GPS says=%d. Using GPS.",
+                            facing, derived))
+                        facing = derived
+                    end
+                    pos = copy(p2)
+                end
+            else
+                log("NAV","Could not step to verify heading. Trusting saved cal.")
+            end
+
+            saveCal()
+            log("NAV",string.format("Calibrated: facing=%d (%s) pos=(%d,%d,%d)",
                 facing,({"N","E","S","W"})[facing+1],pos.x,pos.y,pos.z))
             return
         else
-            log("NAV","Saved cal is "..saved_dist.." blocks off. Re-calibrating.")
+            log("NAV","Saved cal is "..saved_dist.." blocks off. Re-calibrating from scratch.")
         end
     end
 
-    -- No valid saved cal: try all 4 directions for a move
+    -- No valid saved cal: try all 4 directions for a move.
+    -- Track how many right-turns we made so we can update facing correctly.
     log("NAV","Pre-move GPS: ("..p1.x..","..p1.y..","..p1.z..")")
-    local moved = false
+    local moved   = false
+    local turns   = 0
     for attempt=0,3 do
         log("NAV","Calibration attempt "..(attempt+1).."...")
         local ok = turtle.forward()
@@ -831,12 +895,16 @@ local function calibrate()
             local has_block,data = turtle.inspect()
             if has_block and type(data)=="table" then
                 local name = data.name or ""
-                if isDiggable(name) then turtle.dig(); sleep(0.2); ok=turtle.forward()
-                else log("NAV","Protected ahead: ["..name.."]. Turning.") end
+                if isDiggable(name) then
+                    turtle.dig(); sleep(0.2); ok=turtle.forward()
+                else
+                    log("NAV","Protected ahead: ["..name.."]. Turning.")
+                end
             end
         end
         if ok then moved=true; break end
         turtle.turnRight()
+        turns = turns + 1
     end
     if not moved then error("[FATAL] All four directions blocked during calibration.",0) end
 
@@ -1275,6 +1343,9 @@ local function state_MINING()
             log("MINE", string.format("t=%d fuel=%s free=%d pos=(%d,%d,%d)",
                 tunnelled, tostring(turtle.getFuelLevel()), freeSlots(),
                 pos.x, pos.y, pos.z))
+            -- GPS sync every 8 blocks: catches heading drift before it compounds.
+            -- This is the most important guard against the "wrong coordinates" bug.
+            gpsSyncPos()
             saveCal()
         end
     else
