@@ -75,6 +75,79 @@ local zone_log      = {}     -- zone_log[hwid] = { dir, offset, exhausted }
 local lane_counters = {      -- how many lanes assigned per direction
     [0]=0,[1]=0,[2]=0,[3]=0
 }
+local park_claim_by_hwid = {}
+local park_claim_by_key  = {}
+
+local function parkPosKey(p)
+    return math.floor(p.x)..":"..math.floor(p.y)..":"..math.floor(p.z)
+end
+
+local function clearParkClaim(hwid)
+    local old = park_claim_by_hwid[hwid]
+    if old and old.key then park_claim_by_key[old.key] = nil end
+    park_claim_by_hwid[hwid] = nil
+end
+
+local function clearAllParkClaims()
+    park_claim_by_hwid = {}
+    park_claim_by_key = {}
+end
+
+local function isOccupiedByOtherFleet(pos, requester)
+    for hwid, f in pairs(fleet) do
+        if hwid ~= requester and f.pos then
+            local fp = f.pos
+            if math.floor(fp.x or 0) == math.floor(pos.x)
+            and math.floor(fp.y or 0) == math.floor(pos.y)
+            and math.floor(fp.z or 0) == math.floor(pos.z) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function assignUnclaimedParkSlot(hwid, ref)
+    if not PARK_ZONE then return nil end
+    local x1 = math.min(PARK_ZONE.x1, PARK_ZONE.x2)
+    local x2 = math.max(PARK_ZONE.x1, PARK_ZONE.x2)
+    local y  = math.min(PARK_ZONE.y1, PARK_ZONE.y2)
+    local z1 = math.min(PARK_ZONE.z1, PARK_ZONE.z2)
+    local z2 = math.max(PARK_ZONE.z1, PARK_ZONE.z2)
+
+    clearParkClaim(hwid)
+
+    local best, best_d = nil, math.huge
+    local rx = math.floor((ref and ref.x) or x1)
+    local ry = math.floor((ref and ref.y) or y)
+    local rz = math.floor((ref and ref.z) or z1)
+
+    for z = z1, z2 do
+        for x = x1, x2 do
+            local p = { x=x, y=y, z=z }
+            local k = parkPosKey(p)
+            local owner = park_claim_by_key[k]
+            if owner and not fleet[owner] then
+                park_claim_by_key[k] = nil
+                owner = nil
+            end
+            if (not owner or owner == hwid) and not isOccupiedByOtherFleet(p, hwid) then
+                local d = math.abs(x-rx) + math.abs(y-ry) + math.abs(z-rz)
+                if d < best_d then
+                    best_d = d
+                    best = p
+                end
+            end
+        end
+    end
+
+    if best then
+        local k = parkPosKey(best)
+        park_claim_by_key[k] = hwid
+        park_claim_by_hwid[hwid] = { key = k, pos = best }
+    end
+    return best
+end
 
 -- Returns the park position for a given fleet slot index (0-based).
 -- Fills the rectangle row by row along the longest horizontal axis.
@@ -259,6 +332,13 @@ local function shouldStore(name)
     -- Everything else (stone, deepslate, granite, dirt, gravel...)
     -- is assumed solid by the navigator already. Skip it.
     return false
+end
+
+local function isGeoScanNoise(name)
+    local n = tostring(name or ""):lower()
+    -- Geo scanner can report dynamic turtle entities (e.g. "...turtle_advanced (alt)").
+    -- Treat these as transient/air so they never harden into map solids.
+    return n:find("turtle", 1, true) ~= nil
 end
 
 local function saveMap()
@@ -1015,6 +1095,28 @@ local function handleHeartbeat(msg)
     end
 end
 
+local function handleParkReq(net_id, msg)
+    if type(msg.hwid) ~= "string" then return end
+    local slot = assignUnclaimedParkSlot(msg.hwid, msg.pos)
+    rednet.send(net_id, {
+        type = "PARK_ASSIGN",
+        hwid = msg.hwid,
+        nonce = msg.nonce,
+        strict = true,
+        park = slot,
+    }, PROTOCOL)
+    if slot then
+        print(string.format("[PARK]   %s -> strict slot (%d,%d,%d)", msg.hwid, slot.x, slot.y, slot.z))
+    else
+        print(string.format("[PARK]   %s requested strict park but no slot available.", msg.hwid))
+    end
+end
+
+local function handleParkRelease(msg)
+    if type(msg.hwid) ~= "string" then return end
+    clearParkClaim(msg.hwid)
+end
+
 -- ============================================================
 -- ACTIVE ORDERS  (getme command)
 -- active_orders[ore_name] = {
@@ -1267,7 +1369,10 @@ local function handleGeoData(msg)
                 local ay = floor(oy + (b.y or 0))
                 local az = floor(oz + (b.z or 0))
                 local k = ax..":"..ay..":"..az
-                if isAir(b.name) then
+                if isGeoScanNoise(b.name) then
+                    setVoxel(ax, ay, az, AIR_MARKER)
+                    volatile_solids[k] = nil
+                elseif isAir(b.name) then
                     setVoxel(ax, ay, az, AIR_MARKER)
                     volatile_solids[k] = nil
                 else
@@ -1349,6 +1454,12 @@ local function listenerThread()
                 local al = tostring(msg.hwid) .. ": " .. tostring(msg.msg)
                 print("[ALERT]  " .. al)
                 pushAlert(al)
+
+            elseif msg.type == "PARK_REQ" then
+                handleParkReq(net_id, msg)
+
+            elseif msg.type == "PARK_RELEASE" then
+                handleParkRelease(msg)
 
             elseif msg.type == "RESERVE_REQ" then
                 handleReserveReq(net_id, msg)
@@ -1481,6 +1592,7 @@ local function prunerThread()
                 print("[LOST]   " .. hwid .. " went silent (chunk unload or crash).")
                 pushAlert(hwid .. " LOST SIGNAL")
                 clearReservationsFor(hwid)
+                clearParkClaim(hwid)
                 fleet[hwid] = nil
             end
         end
@@ -1524,6 +1636,7 @@ local function terminalThread()
 
         if cmd == "start" then
             rednet.broadcast({ type = "CMD_START" }, PROTOCOL)
+            clearAllParkClaims()
             print("[CMD]    Fleet deployed.")
 
         elseif cmd == "stop" then
@@ -1715,6 +1828,7 @@ local function terminalThread()
             local x2,y2,z2 = tonumber(parts[5]),tonumber(parts[6]),tonumber(parts[7])
             if x1 and y1 and z1 and x2 and y2 and z2 then
                 PARK_ZONE = {x1=x1,y1=y1,z1=z1, x2=x2,y2=y2,z2=z2}
+                clearAllParkClaims()
                 saveConfig(); broadcastConfig()
                 local cols = math.abs(x2-x1)+1
                 local rows = math.abs(z2-z1)+1

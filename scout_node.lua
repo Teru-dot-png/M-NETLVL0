@@ -105,6 +105,8 @@ local reservation_nonce   = 0
 local reservation_pending = {}
 local RESERVE_TTL_MS      = 1400
 local RESERVE_WAIT_MS     = 700
+local park_req_nonce      = 0
+local park_req_pending    = {}
 local nav_last_want       = nil
 local recent_tiles        = {}
 local recent_tile_index   = 1
@@ -186,6 +188,33 @@ local function releaseMoveReservation(target)
         hwid = hwid,
         want = target,
     }, PROTOCOL)
+end
+
+local function requestStrictParkAssignment()
+    if not server_id then return false end
+    park_req_nonce = park_req_nonce + 1
+    local nonce = park_req_nonce
+    park_req_pending[nonce] = { done = false, ok = false }
+
+    pcall(rednet.send, server_id, {
+        type  = "PARK_REQ",
+        hwid  = hwid,
+        nonce = nonce,
+        pos   = copy(pos),
+    }, PROTOCOL)
+
+    local deadline = os.epoch("utc") + 1200
+    while os.epoch("utc") < deadline do
+        local st = park_req_pending[nonce]
+        if st and st.done then
+            park_req_pending[nonce] = nil
+            return st.ok == true
+        end
+        sleep(0.05)
+    end
+
+    park_req_pending[nonce] = nil
+    return false
 end
 
 local function normalizeOreName(name)
@@ -347,7 +376,7 @@ local function isPassable(name)
 end
 
 local function isScanNoise(name)
-    local n = tostring(name or "")
+    local n = tostring(name or ""):lower()
     -- Ignore dynamic turtle entities in scan data so they don't pollute map/cache.
     return n:find("turtle", 1, true) ~= nil
 end
@@ -1903,7 +1932,14 @@ local function state_RTB_DUMP()
         sleep(10)
     end
 
-    if not started then return "PARKED" end
+    if not started then
+        if requestStrictParkAssignment() then
+            log("PARK", "Received strict park assignment from overseer.")
+        else
+            log("PARK", "No strict park assignment reply; using current park slot.")
+        end
+        return "PARKED"
+    end
     return "MINING"
 end
 
@@ -2212,7 +2248,10 @@ local function listenerThread_inner()
     while true do
         local sender,msg = rednet.receive(PROTOCOL)
         if type(msg) == "table" then
-            if     msg.type=="CMD_START"  then started=true;        log("CMD","Start received.")
+            if     msg.type=="CMD_START"  then
+                started=true
+                pcall(rednet.send, server_id, { type="PARK_RELEASE", hwid=hwid }, PROTOCOL)
+                log("CMD","Start received.")
             elseif msg.type=="CMD_STOP"   then started=false;       log("CMD","Stop received.")
             elseif msg.type=="CMD_RECALL" then home_requested=true; log("CMD","Recall received.")
             elseif msg.type=="CONFIG" then
@@ -2254,6 +2293,20 @@ local function listenerThread_inner()
                 if nonce and reservation_pending[nonce] then
                     reservation_pending[nonce].done = true
                     reservation_pending[nonce].granted = (msg.granted == true)
+                end
+
+            elseif msg.type=="PARK_ASSIGN" and msg.hwid==hwid then
+                if type(msg.park) == "table" then
+                    park_pos = msg.park
+                    started = false
+                    home_requested = false
+                    log("PARK", string.format("Strict park assigned: (%d,%d,%d)",
+                        park_pos.x, park_pos.y, park_pos.z))
+                end
+                local nonce = tonumber(msg.nonce)
+                if nonce and park_req_pending[nonce] then
+                    park_req_pending[nonce].done = true
+                    park_req_pending[nonce].ok = type(msg.park) == "table"
                 end
 
             -- O-NET V1: PUSH protocol (Overmind pushCreep equivalent).
