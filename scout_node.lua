@@ -3,8 +3,8 @@
     =========================================
     Role : Tunnels in an assigned direction, hot-swap geo-scans for ore,
            reports finds to the Overseer, detours to mine GOTO targets,
-           refuels itself from mined coal, and returns to a base chest to
-           dump loot when full.
+           refuels itself from mined coal, dumps loot at the DUMP_CHEST, and
+           only crawls to the BASE_CHEST for emergency coal when truly dry.
 
     HARDWARE (exact layout matters):
         RIGHT slot : Ender Modem      (permanent, comms)
@@ -30,7 +30,8 @@ local PROTOCOL      = "MNET_V3"
 local SCAN_RADIUS   = 8      -- geo scanner radius (8 is the free tier)
 local SCAN_EVERY    = 4      -- tunnel this many blocks between scans
 local HEARTBEAT_INT = 3      -- seconds between heartbeats
-local FUEL_MIN      = 200    -- refuel from inventory below this level
+local FUEL_MIN      = 200    -- top up from mined coal below this level
+local FUEL_CRITICAL = 80     -- below this, with no coal aboard, crawl to BASE_CHEST
 local MAX_TUNNEL    = 256    -- blocks to tunnel before turning back
 local SCANNER_SLOT  = 16     -- reserved inventory slot holding the scanner
 
@@ -39,9 +40,11 @@ local SCANNER_SLOT  = 16     -- reserved inventory slot holding the scanner
 -- ============================================================
 local hwid        = string.format("MN-%04X", os.getComputerID() % 0xFFFF)
 local server_id   = nil
-local base        = nil           -- { x, y, z } of the drop chest
+local dump        = nil           -- { x, y, z } DUMP_CHEST (loot output)
+local base        = nil           -- { x, y, z } BASE_CHEST (emergency coal only)
 local my_dir      = 0             -- assigned facing (0=N,1=E,2=S,3=W)
 local started     = false
+local home_requested = false
 local has_scanner = false
 
 -- Position + heading, maintained by dead reckoning
@@ -248,28 +251,78 @@ end
 -- RETURN TO BASE + DUMP
 -- ============================================================
 local function returnAndDump(resume)
-    print("[RTB]   Inventory full. Returning to base chest...")
+    print("[DUMP]  Cargo full. Heading to DUMP_CHEST...")
     refuelSelf()
-    if not base then print("[RTB]   No base set, cannot dump.") return end
+    if not dump then print("[DUMP]  No dump chest set.") return end
 
-    -- Dock one block above the chest and drop down into it.
-    if not moveTo({ x = base.x, y = base.y + 1, z = base.z }) then
-        print("[RTB]   Could not reach base. Parking.")
+    -- Dock one block above the dump chest and drop loot down into it.
+    if not moveTo({ x = dump.x, y = dump.y + 1, z = dump.z }) then
+        print("[DUMP]  Could not reach DUMP_CHEST. Parking.")
+        sleep(5)
         return
     end
 
     for i = 1, 15 do
         turtle.select(i)
-        turtle.dropDown()
+        if turtle.getItemCount(i) > 0 then turtle.dropDown() end
     end
     turtle.select(1)
-    refuelSelf()
-    print("[RTB]   Dump complete. Returning to work face...")
 
+    -- If anything is still aboard, the chest had no room: do not loop, park.
+    local leftover = false
+    for i = 1, 15 do if turtle.getItemCount(i) > 0 then leftover = true break end end
+    if leftover then
+        print("[ALERT] DUMP_CHEST is FULL. Cargo not emptied. Parking.")
+        pcall(rednet.send, server_id, { type = "ALERT", hwid = hwid, msg = "CHEST_FULL", pos = pos }, PROTOCOL)
+        sleep(10)
+        return
+    end
+
+    refuelSelf()
+    print("[DUMP]  Emptied. Returning to work face...")
     if resume then
         moveTo(resume)
         face(my_dir)
     end
+end
+
+-- ============================================================
+-- EMERGENCY FUEL: last-resort coal run to BASE_CHEST
+-- (self-mined coal is always preferred; this only fires when critical)
+-- ============================================================
+local function grabFuelFromBase()
+    if not base then return end
+    local resume = copy(pos)
+    print("[FUEL]  Critical and no coal aboard. Crawling to BASE_CHEST...")
+
+    if not moveTo({ x = base.x, y = base.y + 1, z = base.z }) then
+        print("[FUEL]  Could not reach BASE_CHEST. Parking until refuelled.")
+        sleep(10)
+        return
+    end
+
+    -- Pull a few stacks into empty slots, burn the fuel, hand back the rest
+    -- (so spare pickaxes etc. go straight back into the chest).
+    local pulled = {}
+    for s = 1, 16 do
+        if s ~= SCANNER_SLOT and turtle.getItemCount(s) == 0 then
+            turtle.select(s)
+            if turtle.suckDown(64) then
+                table.insert(pulled, s)
+                if #pulled >= 4 then break end
+            else
+                break
+            end
+        end
+    end
+    for _, s in ipairs(pulled) do
+        turtle.select(s)
+        if turtle.refuel(0) then turtle.refuel() else turtle.dropDown() end
+    end
+    turtle.select(1)
+
+    moveTo(resume)
+    face(my_dir)
 end
 
 -- ============================================================
@@ -307,6 +360,7 @@ local function handshake()
         if sender and type(msg) == "table" and msg.type == "AUTH_ACK" and msg.hwid == hwid then
             server_id = sender
             my_dir    = msg.direction or 0
+            dump      = msg.dump
             base      = msg.base
             facing    = my_dir
             face(my_dir)
@@ -326,10 +380,16 @@ local function listenerThread()
         if type(msg) == "table" then
             if msg.type == "CMD_START" then
                 started = true
-            elseif msg.type == "GOTO" and msg.hwid == hwid and type(msg.pos) == "table" then
-                table.insert(jobs, msg)
             elseif msg.type == "CMD_STOP" then
                 started = false
+            elseif msg.type == "CMD_RECALL" then
+                home_requested = true
+            elseif msg.type == "CONFIG" then
+                if msg.dump then dump = msg.dump end
+                if msg.base then base = msg.base end
+                print("[CFG]   Chest coords updated by Overseer.")
+            elseif msg.type == "GOTO" and msg.hwid == hwid and type(msg.pos) == "table" then
+                table.insert(jobs, msg)
             end
         end
     end
@@ -353,47 +413,63 @@ end
 
 local function brainThread()
     print("[STANDBY] Awaiting CMD_START...")
-    while not started do sleep(0.5) end
-    print("[ACTIVE]  Mining commenced.")
-
     local tunnelled = 0
+
     while true do
-        -- 1. Pending GOTO jobs take priority
-        while #jobs > 0 do
-            doJob(table.remove(jobs, 1))
+        -- Recall: dump cargo, park, and wait for a fresh start.
+        if home_requested then
+            home_requested = false
+            print("[RECALL] Returning home to park...")
+            returnAndDump(nil)
+            started = false
+            print("[RECALL] Parked. Send 'start' to resume.")
         end
 
-        -- 2. Housekeeping
-        refuelSelf()
-        if turtle.getFuelLevel() ~= "unlimited" and turtle.getFuelLevel() <= 0 then
-            print("[FUEL]  Out of fuel and nothing to burn. Halting.")
-            sleep(5)
-        elseif inventoryFull() then
-            returnAndDump(copy(pos))
-            tunnelled = 0
+        if not started then
+            sleep(0.5)                       -- standby / halted: idle quietly
+
         else
-            -- 3. Tunnel one block forward in the assigned direction
-            face(my_dir)
-            if forward() then
-                tunnelled = tunnelled + 1
+            -- 1. Pending GOTO jobs take priority
+            while #jobs > 0 do
+                doJob(table.remove(jobs, 1))
+            end
+
+            -- 2. Fuel: burn mined coal first, BASE_CHEST only as a last resort
+            refuelSelf()
+            local fl = turtle.getFuelLevel()
+            if fl ~= "unlimited" and fl > 0 and fl < FUEL_CRITICAL then
+                grabFuelFromBase()
+            end
+
+            -- 3. Work
+            if turtle.getFuelLevel() ~= "unlimited" and turtle.getFuelLevel() <= 0 then
+                print("[FUEL]  Zero fuel, cannot move. Halting (refuel manually).")
+                sleep(10)
+            elseif inventoryFull() then
+                returnAndDump(copy(pos))
+                tunnelled = 0
             else
-                -- blocked by lava/bedrock: step up and over
-                if not up() then turnRight() end
-            end
+                face(my_dir)
+                if forward() then
+                    tunnelled = tunnelled + 1
+                else
+                    if not up() then turnRight() end   -- lava/bedrock: go up and over
+                end
 
-            -- 4. Periodic scan + ore report
-            if tunnelled % SCAN_EVERY == 0 then
-                reportOres(scanAround())
-            end
+                if tunnelled % SCAN_EVERY == 0 then
+                    reportOres(scanAround())
+                end
 
-            -- 5. End of run: head home, then stop
-            if tunnelled >= MAX_TUNNEL then
-                print("[DONE]  Reached max tunnel length. Returning home.")
-                returnAndDump(nil)
-                pcall(rednet.send, server_id, { type = "HEARTBEAT", hwid = hwid, status = "DONE", pos = pos }, PROTOCOL)
-                return
+                if tunnelled >= MAX_TUNNEL then
+                    print("[DONE]  Reached max tunnel length. Returning home.")
+                    returnAndDump(nil)
+                    started = false
+                    tunnelled = 0
+                    print("[DONE]  Parked. Send 'start' to send it out again.")
+                end
             end
         end
+
         sleep(0)  -- yield so the listener and heartbeat threads run
     end
 end
