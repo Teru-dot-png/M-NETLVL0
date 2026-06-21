@@ -798,6 +798,13 @@ local function renderMap(first_row, last_row, map_col_start, map_col_end)
     end
     local dumpKey = floor(DUMP_CHEST.x) * 1000003 + floor(DUMP_CHEST.z)
     local baseKey = floor(BASE_CHEST.x) * 1000003 + floor(BASE_CHEST.z)
+    local park_x1, park_x2, park_z1, park_z2 = nil, nil, nil, nil
+    if PARK_ZONE then
+        park_x1 = math.min(PARK_ZONE.x1, PARK_ZONE.x2)
+        park_x2 = math.max(PARK_ZONE.x1, PARK_ZONE.x2)
+        park_z1 = math.min(PARK_ZONE.z1, PARK_ZONE.z2)
+        park_z2 = math.max(PARK_ZONE.z1, PARK_ZONE.z2)
+    end
 
     for srow = first_row, last_row do
         local rz      = srow - cx_row
@@ -810,6 +817,9 @@ local function renderMap(first_row, last_row, map_col_start, map_col_end)
             local ch, fg  = " ", BLK
             local ck      = world_x * 1000003 + world_z
             local in_range = math.abs(rx) <= MAP_RADIUS and math.abs(rz) <= MAP_RADIUS
+            local in_park = park_x1
+                and world_x >= park_x1 and world_x <= park_x2
+                and world_z >= park_z1 and world_z <= park_z2
 
             if ck == dumpKey then
                 ch, fg = "D", c2b(colors.orange)
@@ -865,6 +875,11 @@ local function renderMap(first_row, last_row, map_col_start, map_col_end)
                 end
             end
 
+            -- Draw park zone marker only when no higher-priority symbol is present.
+            if in_park and ch == " " then
+                ch, fg = "%", c2b(colors.lightGray)
+            end
+
             t_buf[#t_buf+1] = ch
             f_buf[#f_buf+1] = fg
         end
@@ -892,6 +907,7 @@ local function renderFooter(h, w)
     legItem("@", colors.magenta, "Robot")
     legItem("D", colors.orange,  "Dump")
     legItem("B", colors.cyan,    "Base")
+    legItem("%", colors.lightGray, "Park Zone")
     legItem("#", colors.yellow,  "Known Solid")
     legItem("*", colors.gray,    "Inferred Air")
     legItem("d", colors.cyan,    "Ore")
