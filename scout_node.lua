@@ -436,6 +436,23 @@ local function isEquippable(detail)
     return true
 end
 
+local function ensurePickaxeOnSide()
+    if pickaxeEquipped() then return true end
+    for s=2,15 do
+        local d = turtle.getItemDetail(s)
+        if isEquippable(d) then
+            turtle.select(s)
+            equipOnPickaxeSide()
+            if pickaxeEquipped() then
+                turtle.select(2)
+                return true
+            end
+        end
+    end
+    turtle.select(2)
+    return false
+end
+
 -- ============================================================
 -- PRIMITIVE MOVERS
 -- ============================================================
@@ -1196,7 +1213,13 @@ scanAround = function()
         if d and isScannerName(d.name) then HW.scanner_slot=s; break end
     end
 
-    if not pickaxeEquipped() then log("WARN","Pickaxe not restored after scan swap.") end
+    if not pickaxeEquipped() then
+        if ensurePickaxeOnSide() then
+            log("SCAN","Recovered pickaxe after scan swap.")
+        else
+            log("WARN","Pickaxe not restored after scan swap.")
+        end
+    end
     return results
 end
 
