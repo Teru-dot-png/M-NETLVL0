@@ -1345,6 +1345,9 @@ local function terminalThread()
                 print("Usage: cancelorder <ore>")
             end
 
+        elseif cmd == "help" then
+            printHelp()
+
         elseif cmd and cmd ~= "" then
             print("Unknown command: " .. cmd)
             print("Type  help  for the full list.")
