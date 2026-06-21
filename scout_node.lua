@@ -106,6 +106,11 @@ DIRV = {
     [2]={ dx=0,  dz=1  }, [3]={ dx=-1, dz=0 },
 }
 
+-- Forward declarations: these functions are defined later in the file
+-- but called from navigation code that comes first.
+local scanAround
+local gpsSyncPos
+
 -- ============================================================
 -- HELPERS
 -- ============================================================
@@ -559,7 +564,7 @@ end
 -- If pos is badly off (>3 blocks) we also re-derive facing from two
 -- consecutive GPS readings, since that level of drift usually means
 -- the heading is wrong, not just accumulated float error.
-local function gpsSyncPos()
+gpsSyncPos = function()
     local x,y,z = gps.locate(2)
     if not x then return end
     local drift = math.abs(x-pos.x)+math.abs(y-pos.y)+math.abs(z-pos.z)
@@ -633,9 +638,10 @@ local function greedyStep(goal)
 end
 
 -- ── PHASE 3B: RECOVERY SPIRAL ────────────────────────────
--- When stuck, try all 6 directions in order of which reduces
--- distance to goal the most. Digs if the block is diggable.
--- Returns true if we broke out of the stuck position.
+-- When stuck, try all 6 directions sorted by distance to goal.
+-- If all horizontal directions are blocked by protected blocks,
+-- try climbing over: step up, step forward, step down the other side.
+-- This handles item_vaults, chests, and other protected furniture.
 local function recoverSpiral(goal)
     log("NAV","Running recovery spiral...")
 
@@ -643,38 +649,52 @@ local function recoverSpiral(goal)
         return math.abs(p.x-goal.x)+math.abs(p.y-goal.y)+math.abs(p.z-goal.z)
     end
 
-    local best_dist = dist(pos)
     local dirs = {
-        function() face(0); return stepForward() end, -- N
-        function() face(1); return stepForward() end, -- E
-        function() face(2); return stepForward() end, -- S
-        function() face(3); return stepForward() end, -- W
+        function() face(0); return stepForward() end,
+        function() face(1); return stepForward() end,
+        function() face(2); return stepForward() end,
+        function() face(3); return stepForward() end,
         function() return stepUp()   end,
         function() return stepDown() end,
     }
-
-    -- Sort by which direction's neighbour is closest to goal
-    local candidates = {}
     local nbpos = {
-        {x=pos.x,   y=pos.y,   z=pos.z-1}, -- N
-        {x=pos.x+1, y=pos.y,   z=pos.z},   -- E
-        {x=pos.x,   y=pos.y,   z=pos.z+1}, -- S
-        {x=pos.x-1, y=pos.y,   z=pos.z},   -- W
-        {x=pos.x,   y=pos.y+1, z=pos.z},   -- up
-        {x=pos.x,   y=pos.y-1, z=pos.z},   -- down
+        {x=pos.x,   y=pos.y,   z=pos.z-1},
+        {x=pos.x+1, y=pos.y,   z=pos.z  },
+        {x=pos.x,   y=pos.y,   z=pos.z+1},
+        {x=pos.x-1, y=pos.y,   z=pos.z  },
+        {x=pos.x,   y=pos.y+1, z=pos.z  },
+        {x=pos.x,   y=pos.y-1, z=pos.z  },
     }
+
+    local candidates = {}
     for i=1,6 do candidates[i] = {i=i, d=dist(nbpos[i])} end
     table.sort(candidates, function(a,b) return a.d<b.d end)
 
     for _,c in ipairs(candidates) do
-        local fn = dirs[c.i]
-        if fn() then
-            log("NAV",string.format("Spiral moved. Now at (%d,%d,%d).",pos.x,pos.y,pos.z))
+        if dirs[c.i]() then
+            log("NAV",string.format("Spiral moved. Now at (%d,%d,%d).", pos.x,pos.y,pos.z))
             return true
         end
     end
 
-    log("NAV","Spiral failed. Truly blocked.")
+    -- All 6 directions failed. Try the "climb over" manoeuvre:
+    -- go up one block, then try each horizontal direction.
+    -- This gets over a single-block-tall protected obstacle like a vault.
+    log("NAV","All 6 directions blocked. Attempting climb-over...")
+    if stepUp() then
+        for dir = 0, 3 do
+            face(dir)
+            if stepForward() then
+                log("NAV",string.format("Climbed over obstacle. Now at (%d,%d,%d).",
+                    pos.x,pos.y,pos.z))
+                return true
+            end
+        end
+        -- Could not move horizontally after going up; go back down
+        stepDown()
+    end
+
+    log("NAV","Spiral and climb-over both failed. Truly blocked.")
     return false
 end
 
@@ -932,7 +952,7 @@ end
 -- The brain thread must not check pickaxeEquipped() during this window.
 local scanning_now = false
 
-local function scanAround()
+scanAround = function()
     if not HW.has_scanner or not HW.scanner_slot then return {} end
     if not HW.pick_side then return {} end
 
