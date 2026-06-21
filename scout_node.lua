@@ -245,12 +245,14 @@ local function mapLoop()
         local pos = getPosition()
 
         -- 5. Construct GEO_DATA payload.
+        --    Key must be "scan_data" so the Main Mapper's handleGeoData
+        --    can read it. (This mismatch was why nothing was mapping.)
         local payload = {
-            type         = "GEO_DATA",
-            hwid         = local_hwid,
-            pos          = pos,
-            fuel         = turtle.getFuelLevel(),
-            scan_results = scan_data,
+            type      = "GEO_DATA",
+            hwid      = local_hwid,
+            pos       = pos,
+            fuel      = turtle.getFuelLevel(),
+            scan_data = scan_data,
         }
 
         -- 6. Transmit to Main Mapper.
