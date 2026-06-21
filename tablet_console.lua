@@ -1,7 +1,11 @@
 --[[
     O-NET V1 | TABLET CONSOLE
     -------------------------------------------------------
-    Pocket/tablet companion UI for fleet command and scouting.
+    Pocket/tablet companion UI for fleet command.
+
+    NOTE: Pocket computers accept only one peripheral upgrade.
+    The wireless modem is mandatory, so geo scanner upload is
+    not supported on the tablet. Use a miner turtle to scan.
 
     Features:
       - Self-adapting terminal UI (resizes with tablet screen)
@@ -9,7 +13,6 @@
       - Commands to overseer:
           START / STOP / RECALL
           COME_TO_ME / GOTO / GETME / TUNNEL_FROM
-      - Geo scanner upload: sends GEO_DATA from tablet position
 
     Controls:
       1..9 / 0  select robot index
@@ -20,14 +23,12 @@
       a         start all
       o         stop all
       r         recall all
-      x         geo scan upload
       s         force sync now
       q         quit
 ]]
 
 local PROTOCOL = "ONET_V1"
 local TABLET_ID = string.format("TB-%04X", os.getComputerID() % 0xFFFF)
-local SCAN_RADIUS = 8
 
 local server_id = nil
 local fleet = {}
@@ -79,21 +80,6 @@ if not modem then
     error("No modem found. Attach wireless/ender modem.", 0)
 end
 rednet.open(peripheral.getName(modem))
-
-local function detectGeoScanner()
-    for _, n in ipairs(peripheral.getNames()) do
-        local t = tostring(peripheral.getType(n) or ""):lower()
-        if t:find("geo", 1, true) then
-            local p = peripheral.wrap(n)
-            if p and type(p.scan) == "function" then
-                return p, n
-            end
-        end
-    end
-    return nil, nil
-end
-
-local geo, geo_name = detectGeoScanner()
 
 local function getGpsPos(timeout)
     if not gps or type(gps.locate) ~= "function" then return nil end
@@ -164,48 +150,16 @@ local function setMessage(s)
     last_msg = tostring(s or "")
 end
 
-local function doGeoScanUpload()
-    if not geo then
-        geo, geo_name = detectGeoScanner()
-    end
-    if not geo then
-        setMessage("No geo scanner peripheral found.")
-        return
-    end
-
-    local p = getGpsPos(2)
-    if not p then
-        setMessage("GPS lock required for scan upload.")
-        return
-    end
-
-    local ok, scan = pcall(geo.scan, SCAN_RADIUS)
-    if not ok or type(scan) ~= "table" then
-        setMessage("Geo scan failed.")
-        return
-    end
-
-    sendToOverseer({
-        type = "GEO_DATA",
-        hwid = TABLET_ID,
-        pos = p,
-        scan_data = scan,
-        scan_radius = SCAN_RADIUS,
-    })
-    setMessage(string.format("Uploaded scan: %d blocks from (%d,%d,%d)", #scan, p.x, p.y, p.z))
-end
-
 local function drawUI()
     local w, h = term.getSize()
     term.setCursorPos(1, 1)
     term.clear()
 
     local conn = server_id and ("linked:" .. tostring(server_id)) or "searching"
-    local scanner_state = geo and ("yes:" .. tostring(geo_name)) or "no"
     local age = (last_sync_ms > 0) and math.floor((nowMs() - last_sync_ms) / 1000) or -1
 
     print(short("O-NET Tablet " .. TABLET_ID .. "  " .. conn, w))
-    print(short("Fleet:" .. #fleet .. "  Scanner:" .. scanner_state .. "  Sync:" .. (age >= 0 and (age .. "s") or "-"), w))
+    print(short("Fleet:" .. #fleet .. "  Sync:" .. (age >= 0 and (age .. "s") or "-"), w))
 
     local sel = selectedBot()
     if sel then
@@ -215,7 +169,7 @@ local function drawUI()
     end
 
     print(short("1..9/0 select | c come | g goto | t tunnel | m getme", w))
-    print(short("a start | o stop | r recall | x scan | s sync | q quit", w))
+    print(short("a start | o stop | r recall | s sync | q quit", w))
 
     local header = "#  HWID       ST        AV   FUEL  POS"
     print(short(header, w))
@@ -394,9 +348,6 @@ local function uiThread()
             elseif ch == "r" then
                 sendTabletCmd("RECALL", {})
                 setMessage("RECALL broadcast.")
-
-            elseif ch == "x" then
-                doGeoScanUpload()
 
             elseif ch == "s" then
                 requestSync()
