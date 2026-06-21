@@ -264,32 +264,48 @@ end
 -- ============================================================
 -- PICKAXE HELPERS  (uses HW map, never assumes slot numbers)
 -- ============================================================
+
+-- Returns true if the pickaxe side currently holds a pickaxe.
+-- IMPORTANT: never call this while the scanner is mid-swap.
+-- After scanAround() returns, the pickaxe is always back on pick_side.
 local function pickaxeEquipped()
     if not HW.pick_side then return false end
+
+    -- If a peripheral is present on the pick side the scanner is there.
+    -- However only count it as "not a pickaxe" if we are sure it is the
+    -- scanner: the modem is on the OTHER side, so any peripheral on
+    -- pick_side is the scanner.
     if peripheral.isPresent(HW.pick_side) then return false end
-    local getEq = HW.pick_side == "left" and turtle.getEquippedLeft or turtle.getEquippedRight
+
+    -- Try the getEquipped API (CC:T 1.109+)
+    local getEq = HW.pick_side == "left" and turtle.getEquippedLeft
+                                          or  turtle.getEquippedRight
     if getEq then
         local info = getEq()
-        if not info then return false end
+        if info == nil then return false end          -- slot is empty
         return tostring(info.name or ""):find("pickaxe") ~= nil
     end
-    return true  -- older CC:T fallback
+
+    -- Fallback for older CC:T: no peripheral on pick_side = pickaxe is there.
+    -- This is safe because the modem is on the other side.
+    return true
 end
 
 local function equipOnPickaxeSide()
-    if HW.pick_side == "left" then return turtle.equipLeft() else return turtle.equipRight() end
+    if HW.pick_side == "left" then return turtle.equipLeft()
+    else                            return turtle.equipRight() end
 end
 
--- isEquippable: CC:T only accepts fresh, undamaged, unenchanted diamond pickaxes
+-- CC:T equip rules: undamaged + unenchanted. Forge tag NBT is fine.
 local function isEquippable(detail)
     if not detail then return false end
     if not tostring(detail.name or ""):find("pickaxe") then return false end
     if (detail.damage or 0) > 0 then
-        log("PICK", "Pickaxe has "..detail.damage.." damage — needs to be brand new.")
+        log("PICK", string.format("Rejected: %d damage. Need full durability.", detail.damage))
         return false
     end
     if detail.enchantments and #detail.enchantments > 0 then
-        log("PICK", "Pickaxe is enchanted — CC:T cannot equip enchanted tools.")
+        log("PICK", "Rejected: enchanted. CC:T cannot equip enchanted tools.")
         return false
     end
     return true
@@ -775,6 +791,10 @@ end
 -- ============================================================
 -- GEO SCAN  (uses HW.scanner_slot, never assumes slot 16)
 -- ============================================================
+-- Scanning lock: true while the hot-swap is in progress.
+-- The brain thread must not check pickaxeEquipped() during this window.
+local scanning_now = false
+
 local function scanAround()
     if not HW.has_scanner or not HW.scanner_slot then return {} end
     if not HW.pick_side then return {} end
@@ -795,6 +815,7 @@ local function scanAround()
                 return {}
             end
         end
+        scanning_now = true
         turtle.select(HW.scanner_slot)
         if HW.pick_side=="left" then turtle.equipLeft() else turtle.equipRight() end
     end
@@ -813,6 +834,7 @@ local function scanAround()
     turtle.select(HW.scanner_slot)
     if HW.pick_side=="left" then turtle.equipLeft() else turtle.equipRight() end
     turtle.select(1)
+    scanning_now = false
 
     -- Update scanner slot in case the swap moved it
     for s=1,16 do
@@ -1125,7 +1147,8 @@ local function state_MINING()
     if not started        then return "STANDBY"    end
     if home_requested     then home_requested=false; return "RTB_DUMP" end
     if #jobs > 0          then goto_job=table.remove(jobs,1); return "GOTO" end
-    if not pickaxeEquipped() then return "FETCH_PICK" end
+    -- Do not check pickaxe mid-scan: the scanner is temporarily on pick_side
+    if not scanning_now and not pickaxeEquipped() then return "FETCH_PICK" end
 
     refuelSelf()
     if fuelLevel() > 0 and fuelLevel() < FUEL_CRITICAL then return "RTB_FUEL" end
