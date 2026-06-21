@@ -1025,6 +1025,15 @@ end
 -- ============================================================
 -- DUMP LOOT
 -- ============================================================
+-- Items that must NEVER be dropped into the dump chest.
+-- Checked by name fragment so "diamond_pickaxe" and
+-- "advancedperipherals:geo_scanner" are both caught.
+local function isTool(detail)
+    if not detail then return false end
+    local n = tostring(detail.name or "")
+    return n:find("pickaxe") ~= nil or n:find("geo_scanner") ~= nil
+end
+
 local function returnAndDump(resumePos)
     log("DUMP","Cargo full. Heading to DUMP_CHEST...")
     refuelSelf()
@@ -1032,10 +1041,23 @@ local function returnAndDump(resumePos)
     if not moveTo({x=dump.x,y=dump.y+1,z=dump.z}) then
         log("DUMP","Could not reach DUMP_CHEST. Parking 10s."); sleep(10); return
     end
-    for i=1,15 do turtle.select(i); if turtle.getItemCount(i)>0 then turtle.dropDown() end end
+    for i=1,15 do
+        if turtle.getItemCount(i) > 0 then
+            local detail = turtle.getItemDetail(i)
+            if isTool(detail) then
+                log("DUMP","Keeping tool in slot "..i..": "..(detail.name or "?"))
+            else
+                turtle.select(i); turtle.dropDown()
+            end
+        end
+    end
     turtle.select(1)
-    local leftover=false
-    for i=1,15 do if turtle.getItemCount(i)>0 then leftover=true; break end end
+    local leftover = false
+    for i=1,15 do
+        if turtle.getItemCount(i) > 0 and not isTool(turtle.getItemDetail(i)) then
+            leftover = true; break
+        end
+    end
     if leftover then
         log("DUMP","DUMP_CHEST FULL.")
         pcall(rednet.send,server_id,{type="ALERT",hwid=hwid,msg="CHEST_FULL",pos=copy(pos)},PROTOCOL)
@@ -1054,7 +1076,15 @@ local function grabFuelFromBase()
     if not moveTo({x=base.x,y=base.y+1,z=base.z}) then log("FUEL","Cannot reach base."); sleep(10); return end
     for s=1,15 do if turtle.getItemCount(s)==0 then turtle.select(s); if not turtle.suckDown(64) then break end end end
     burnAboard(FUEL_TARGET)
-    for s=1,15 do turtle.select(s); if turtle.getItemCount(s)>0 and not turtle.refuel(0) then turtle.dropDown() end end
+    for s=1,15 do
+        turtle.select(s)
+        if turtle.getItemCount(s)>0 and not turtle.refuel(0) then
+            -- Never throw away tools, even if they ended up in a cargo slot
+            if not isTool(turtle.getItemDetail(s)) then
+                turtle.dropDown()
+            end
+        end
+    end
     turtle.select(1); moveTo(resume); face(my_dir)
     log("FUEL","Fuel = "..tostring(turtle.getFuelLevel()))
 end
@@ -1380,13 +1410,23 @@ local function state_RTB_DUMP()
 
     if moveTo({x=dump.x, y=dump.y+1, z=dump.z}) then
         for i=1,15 do
-            turtle.select(i)
-            if turtle.getItemCount(i)>0 then turtle.dropDown() end
+            if turtle.getItemCount(i) > 0 then
+                local detail = turtle.getItemDetail(i)
+                if isTool(detail) then
+                    log("DUMP","Keeping tool in slot "..i..": "..(detail and detail.name or "?"))
+                else
+                    turtle.select(i); turtle.dropDown()
+                end
+            end
         end
         turtle.select(1)
 
         local leftover = false
-        for i=1,15 do if turtle.getItemCount(i)>0 then leftover=true; break end end
+        for i=1,15 do
+            if turtle.getItemCount(i)>0 and not isTool(turtle.getItemDetail(i)) then
+                leftover=true; break
+            end
+        end
         if leftover then
             log("DUMP","DUMP_CHEST FULL. Cargo remains.")
             pcall(rednet.send, server_id,
@@ -1441,7 +1481,19 @@ end
 
 -- ── FETCH_PICK ───────────────────────────────────────────
 local function state_FETCH_PICK()
-    log("PICK","Pickaxe missing. Heading to BASE_CHEST...")
+    -- Wait out any in-progress scan before concluding the pick is missing.
+    -- The heartbeat scanner hot-swap puts a peripheral on pick_side for ~1s.
+    -- Without this wait, a false FETCH_PICK triggers every scan cycle.
+    local ticks = 0
+    while scanning_now and ticks < 20 do sleep(0.3); ticks=ticks+1 end
+
+    -- Re-check now that we are sure no scan is running
+    if pickaxeEquipped() then
+        log("PICK","Pickaxe IS equipped (false alarm, scan was mid-swap). Resuming.")
+        return started and "MINING" or "STANDBY"
+    end
+
+    log("PICK","Pickaxe confirmed missing. Heading to BASE_CHEST...")
     fetchPickaxeFromBase(copy(pos))
     if pickaxeEquipped() then
         return started and "MINING" or "STANDBY"
@@ -1492,9 +1544,14 @@ local STATE_FN = {
 }
 
 local function brainThread_inner()
-    -- Boot pickaxe fetch if needed before entering the state machine
+    -- Boot pickaxe check: wait for any in-progress scan to finish first,
+    -- then check. This prevents the scanner being mid-swap from triggering
+    -- a spurious FETCH_PICK loop on every brain thread restart.
+    local wait_ticks = 0
+    while scanning_now and wait_ticks < 20 do sleep(0.5); wait_ticks=wait_ticks+1 end
+
     if not pickaxeEquipped() then
-        log("PICK","No pickaxe at boot. Fetching from BASE_CHEST...")
+        log("PICK","No pickaxe detected at boot. Fetching from BASE_CHEST...")
         log("PICK","Need FRESH, UNDAMAGED, UNENCHANTED diamond pickaxe.")
         setState("FETCH_PICK")
         state_FETCH_PICK()
