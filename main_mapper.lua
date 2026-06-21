@@ -196,6 +196,11 @@ local master_voxels = {}
 local total_voxels  = 0
 local AIR_MARKER    = "__air__"  -- known, scanned air cell (dug tunnel)
 
+-- Volatile solid sightings used only for negative-space inference.
+-- This is RAM-only and intentionally never persisted to disk.
+local volatile_solids = {}
+local VOL_SOLID_TTL_MS = 180000
+
 local view_cx, view_cz, view_y = 0, 0, 64
 
 -- Phase 5B: ore clusters
@@ -215,6 +220,17 @@ local ORE_FEED_MAX = 8
 local MAP_FILE      = "mnet_map.dat"
 local map_dirty     = false
 local last_map_save = 0
+local map_persist_enabled = true
+local map_persist_reason  = nil
+
+local function disableMapPersistence(reason)
+    if map_persist_enabled then
+        map_persist_enabled = false
+        map_persist_reason = tostring(reason or "unknown error")
+        print("[MAP]    Persistence disabled; running RAM-only.")
+        print("[MAP]    Reason: " .. map_persist_reason)
+    end
+end
 
 -- Map file format: one voxel per line, tab-separated:
 --   x\ty\tz\tname
@@ -246,26 +262,43 @@ local function shouldStore(name)
 end
 
 local function saveMap()
-    local f = fs.open(MAP_FILE, "w")
-    if not f then
-        print("[MAP]    ERROR: could not open map file for writing.")
-        return
+    if not map_persist_enabled then return false end
+
+    local ok_open, f = pcall(fs.open, MAP_FILE, "w")
+    if not ok_open or not f then
+        disableMapPersistence(ok_open and "could not open map file for writing" or f)
+        return false
     end
+
     local count = 0
     for y, xt in pairs(master_voxels) do
         for x, zt in pairs(xt) do
             for z, name in pairs(zt) do
                 if shouldStore(name) then
-                    f.writeLine(x.."\t"..y.."\t"..z.."\t"..name)
+                    local ok_write, err_write = pcall(function()
+                        f.writeLine(x.."\t"..y.."\t"..z.."\t"..name)
+                    end)
+                    if not ok_write then
+                        pcall(function() f.close() end)
+                        disableMapPersistence(err_write)
+                        return false
+                    end
                     count = count + 1
                 end
             end
         end
     end
-    f.close()
+
+    local ok_close, err_close = pcall(function() f.close() end)
+    if not ok_close then
+        disableMapPersistence(err_close)
+        return false
+    end
+
     map_dirty     = false
     last_map_save = os.epoch("utc")
     print(string.format("[MAP]    Saved %d entries (of %d voxels) to disk.", count, total_voxels))
+    return true
 end
 
 local function loadMap()
@@ -803,9 +836,9 @@ local function renderMap(first_row, last_row, map_col_start, map_col_end)
                     end
                     if ch == " " then
                         if saw_known_air then
-                            ch, fg = " ", BLK
+                            ch, fg = "*", c2b(colors.gray)
                         else
-                            ch, fg = "#", c2b(colors.yellow)
+                            ch, fg = " ", BLK
                         end
                     end
                 end
@@ -825,9 +858,9 @@ local function renderMap(first_row, last_row, map_col_start, map_col_end)
                 end
                 if ch == " " then
                     if saw_known_air then
-                        ch, fg = " ", BLK
+                        ch, fg = "*", c2b(colors.gray)
                     else
-                        ch, fg = "#", c2b(colors.yellow)
+                        ch, fg = " ", BLK
                     end
                 end
             end
@@ -859,8 +892,8 @@ local function renderFooter(h, w)
     legItem("@", colors.magenta, "Robot")
     legItem("D", colors.orange,  "Dump")
     legItem("B", colors.cyan,    "Base")
-    legItem("#", colors.yellow,  "Unknown/Rock")
-    legItem(" ", colors.black,   "Tunnel Air")
+    legItem("#", colors.yellow,  "Known Solid")
+    legItem("*", colors.gray,    "Inferred Air")
     legItem("d", colors.cyan,    "Ore")
     while #leg_t < w do leg_t[#leg_t+1]=" "; leg_f[#leg_f+1]=BLK; leg_b[#leg_b+1]=BLK end
     mon.setCursorPos(1, h - 1)
@@ -1201,55 +1234,54 @@ local function handleGeoData(msg)
     if f then f.last_pulse = os.epoch("utc"); if msg.pos then f.pos = msg.pos end end
     local scan, p = msg.scan_data, msg.pos
     if type(scan) == "table" and type(p) == "table" then
-        local ox, oy, oz = p.x or 0, p.y or 0, p.z or 0
+        local ox, oy, oz = floor(p.x or 0), floor(p.y or 0), floor(p.z or 0)
+        local now = os.epoch("utc")
+        local seen = {}
+
+        -- Prune stale volatile sightings to cap RAM growth.
+        for k, v in pairs(volatile_solids) do
+            if type(v) ~= "table" or (now - (tonumber(v.ts) or 0)) > VOL_SOLID_TTL_MS then
+                volatile_solids[k] = nil
+            end
+        end
+
         for _, b in ipairs(scan) do
             if type(b) == "table" and type(b.name) == "string" then
                 local ax = floor(ox + (b.x or 0))
                 local ay = floor(oy + (b.y or 0))
                 local az = floor(oz + (b.z or 0))
+                local k = ax..":"..ay..":"..az
                 if isAir(b.name) then
                     setVoxel(ax, ay, az, AIR_MARKER)
+                    volatile_solids[k] = nil
                 else
-                    setVoxel(ax, ay, az, b.name)
+                    seen[k] = true
+                    if shouldStore(b.name) then
+                        setVoxel(ax, ay, az, b.name)
+                    else
+                        -- Rock-like solids are tracked only in RAM.
+                        volatile_solids[k] = { x=ax, y=ay, z=az, ts=now }
+                    end
                 end
             end
         end
 
         -- Geo scanner typically reports non-air blocks only.
-        -- If a block inside this scan radius is no longer reported, treat
-        -- previously known in-range solids as air (dug/opened space).
+        -- If a volatile in-range solid is no longer reported, treat that
+        -- negative space as inferred air and persist only the air marker.
         local radius = floor(tonumber(msg.scan_radius) or 0)
         if radius > 0 then
-            local seen = {}
-            for _, b in ipairs(scan) do
-                if type(b) == "table" and type(b.name) == "string" and not isAir(b.name) then
-                    local sx = floor(ox + (b.x or 0))
-                    local sy = floor(oy + (b.y or 0))
-                    local sz = floor(oz + (b.z or 0))
-                    seen[sx..":"..sy..":"..sz] = true
-                end
-            end
-
             local r2 = radius * radius
-            for y, xt in pairs(master_voxels) do
-                if y >= (oy - radius) and y <= (oy + radius) then
-                    for x, zt in pairs(xt) do
-                        if x >= (ox - radius) and x <= (ox + radius) then
-                            for z, name in pairs(zt) do
-                                if z >= (oz - radius) and z <= (oz + radius) then
-                                    local dx = x - ox
-                                    local dy = y - oy
-                                    local dz = z - oz
-                                    if (dx*dx + dy*dy + dz*dz) <= r2 then
-                                        local k = x..":"..y..":"..z
-                                        if not seen[k] and not isAir(name) then
-                                            zt[z] = AIR_MARKER
-                                            map_dirty = true
-                                        end
-                                    end
-                                end
-                            end
-                        end
+            for k, v in pairs(volatile_solids) do
+                local dx = v.x - ox
+                local dy = v.y - oy
+                local dz = v.z - oz
+                if (dx*dx + dy*dy + dz*dz) <= r2 then
+                    if not seen[k] then
+                        setVoxel(v.x, v.y, v.z, AIR_MARKER)
+                        volatile_solids[k] = nil
+                    else
+                        v.ts = now
                     end
                 end
             end
@@ -1442,9 +1474,11 @@ end
 local function mapSaveThread()
     while true do
         sleep(60)
-        if map_dirty then
-            saveMap()
+        if map_persist_enabled and map_dirty then
+            local ok = saveMap()
+            if ok then
             print(string.format("[MAP]    Auto-saved %d voxels.", total_voxels))
+            end
         end
     end
 end
@@ -1574,10 +1608,17 @@ local function terminalThread()
             print(string.format("  Centre  : (%d,%d)  Y=%d", view_cx, view_cz, view_y))
             print(string.format("  File    : %s", fs.exists(MAP_FILE) and MAP_FILE or "not saved yet"))
             print(string.format("  Dirty   : %s", map_dirty and "yes (unsaved changes)" or "no"))
+            print(string.format("  Persist : %s", map_persist_enabled and "enabled" or ("disabled ("..tostring(map_persist_reason or "error")..")")))
 
         elseif cmd == "savemap" then
-            saveMap()
-            print(string.format("[MAP]    Saved %d voxels to disk.", total_voxels))
+            if not map_persist_enabled then
+                print("[MAP]    Persistence disabled; running RAM-only.")
+            else
+                local ok = saveMap()
+                if ok then
+                    print(string.format("[MAP]    Saved %d voxels to disk.", total_voxels))
+                end
+            end
 
         elseif cmd == "clearmap" then
             master_voxels = {}; total_voxels = 0; map_dirty = false
