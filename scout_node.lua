@@ -24,6 +24,10 @@
            which fits a turtle's two upgrade slots.
         3. The fuel check now safely handles the "unlimited" fuel mode
            (comparing the string "unlimited" against a number would crash).
+        4. Added auto-refuel. When fuel runs low the node now scans every
+           inventory slot and burns any valid fuel (coal, charcoal, lava
+           buckets, etc.). The original only printed a warning and never
+           actually consumed anything.
 ]]
 
 -- ============================================================
@@ -115,6 +119,23 @@ local function moveForward()
 end
 
 -- ============================================================
+-- FUEL HELPER
+-- ============================================================
+-- Walks every inventory slot and burns anything that is valid fuel.
+-- Important: a turtle can only refuel from its CURRENTLY SELECTED slot,
+-- so we must select each slot in turn. There is no built-in "scan all
+-- slots and auto-burn"; this loop is how you get that behaviour.
+local function refuelFromInventory()
+    for slot = 1, 16 do
+        turtle.select(slot)
+        if turtle.refuel(0) then   -- refuel(0) tests the slot without consuming
+            turtle.refuel()        -- valid fuel found, consume the whole stack
+        end
+    end
+    turtle.select(1)               -- always return to slot 1 afterwards
+end
+
+-- ============================================================
 -- STATE: REQ_AUTH -> ACK_AUTH
 -- ============================================================
 local function performHandshake()
@@ -180,11 +201,17 @@ end
 -- ============================================================
 local function mapLoop()
     while true do
-        -- 1. Fuel check (safely handles the "unlimited" fuel mode).
+        -- 1. Fuel check. If low, scan every inventory slot and refuel.
         local fuel = turtle.getFuelLevel()
         if fuel ~= "unlimited" and fuel < CFG.FUEL_WARN_LEVEL then
+            print(string.format("[FUEL]  Low (%d). Scanning inventory for fuel...", fuel))
+            refuelFromInventory()
+            fuel = turtle.getFuelLevel()
+        end
+
+        if fuel ~= "unlimited" and fuel < CFG.FUEL_WARN_LEVEL then
             print(string.format(
-                "[WARN]  Fuel critical (%d). Halting movement until refuelled.",
+                "[WARN]  No usable fuel found (%d). Halting movement until refuelled.",
                 fuel
             ))
             os.sleep(5)
