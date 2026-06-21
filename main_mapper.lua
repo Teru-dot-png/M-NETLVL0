@@ -26,7 +26,10 @@
 -- CONFIGURATION  (edit these)
 -- ============================================================
 local PROTOCOL  = "MNET_V3"
-local BASE_CHEST = { x = 0, y = 64, z = 0 }   -- <-- coords of the drop chest
+
+-- Two depots. Look at each block, press F3, read the "Targeted Block" coords.
+local DUMP_CHEST = { x = 0, y = 64, z = 0 }   -- mined loot is emptied here
+local BASE_CHEST = { x = 0, y = 64, z = 2 }   -- emergency coal + spare pickaxes
 
 local WANT_LIST = {                            -- ores worth a detour
     diamond = true, ancient_debris = true, emerald = true,
@@ -36,6 +39,37 @@ local WANT_LIST = {                            -- ores worth a detour
 local DIRECTIONS = { 0, 1, 2, 3 }   -- N, E, S, W assigned round-robin
 local HB_TIMEOUT = 12000             -- ms before a miner is declared lost
 local DISP_REFRESH = 1               -- seconds between status redraws
+
+-- ============================================================
+-- CONFIG PERSISTENCE (typed coords survive reboots)
+-- ============================================================
+local CONFIG_FILE = "mnet_overseer.cfg"
+
+local function saveConfig()
+    local f = fs.open(CONFIG_FILE, "w")
+    if f then
+        f.write(textutils.serialize({ dump = DUMP_CHEST, base = BASE_CHEST, want = WANT_LIST }))
+        f.close()
+    end
+end
+
+local function loadConfig()
+    if not fs.exists(CONFIG_FILE) then return end
+    local f = fs.open(CONFIG_FILE, "r")
+    if not f then return end
+    local data = textutils.unserialize(f.readAll() or "")
+    f.close()
+    if type(data) == "table" then
+        if data.dump then DUMP_CHEST = data.dump end
+        if data.base then BASE_CHEST = data.base end
+        if data.want then WANT_LIST  = data.want end
+    end
+end
+
+-- Push current chest coords to every miner that is already running.
+local function broadcastConfig()
+    rednet.broadcast({ type = "CONFIG", dump = DUMP_CHEST, base = BASE_CHEST }, PROTOCOL)
+end
 
 -- ============================================================
 -- STATE
@@ -96,6 +130,7 @@ local function handleAuth(net_id, msg)
         type      = "AUTH_ACK",
         hwid      = msg.hwid,
         direction = dir,
+        dump      = DUMP_CHEST,
         base      = BASE_CHEST,
     }, PROTOCOL)
 
@@ -146,6 +181,8 @@ local function listenerThread()
             if     msg.type == "AUTH_REQ"   then handleAuth(net_id, msg)
             elseif msg.type == "HEARTBEAT"  then handleHeartbeat(msg)
             elseif msg.type == "ORE_REPORT" then handleOreReport(msg)
+            elseif msg.type == "ALERT"      then
+                print("[ALERT]  " .. tostring(msg.hwid) .. ": " .. tostring(msg.msg))
             end
         end
     end
@@ -164,16 +201,49 @@ local function prunerThread()
     end
 end
 
+local function splitWords(s)
+    local t = {}
+    for w in s:gmatch("%S+") do t[#t + 1] = w end
+    return t
+end
+
+local function parseCoords(a, b, c)
+    local x, y, z = tonumber(a), tonumber(b), tonumber(c)
+    if x and y and z then return { x = x, y = y, z = z } end
+    return nil
+end
+
+local function printHelp()
+    print("Commands:")
+    print("  start | stop | recall   deploy / halt-in-place / call home")
+    print("  status                  show fleet + supplies")
+    print("  setdump x y z           set the loot dump chest")
+    print("  setbase x y z           set the emergency coal chest")
+    print("  coords                  show current chest coords")
+    print("  want <ore>              add an ore to the fetch list")
+    print("  unwant <ore>            remove an ore from the fetch list")
+    print("  wants                   show the fetch list")
+    print("  help                    this list")
+end
+
 local function terminalThread()
     while true do
-        local input = read()
-        if input == "start" then
+        local parts = splitWords(read())
+        local cmd = parts[1]
+
+        if cmd == "start" then
             rednet.broadcast({ type = "CMD_START" }, PROTOCOL)
             print("[CMD]    Fleet deployed.")
-        elseif input == "stop" then
+
+        elseif cmd == "stop" then
             rednet.broadcast({ type = "CMD_STOP" }, PROTOCOL)
-            print("[CMD]    Halt sent.")
-        elseif input == "status" then
+            print("[CMD]    Halt-in-place sent.")
+
+        elseif cmd == "recall" then
+            rednet.broadcast({ type = "CMD_RECALL" }, PROTOCOL)
+            print("[CMD]    Recall sent. Turtles will dump and park.")
+
+        elseif cmd == "status" then
             print("---- FLEET ----")
             for hwid, f in pairs(fleet) do
                 local p = f.pos or {}
@@ -185,6 +255,46 @@ local function terminalThread()
             for name, count in pairs(checkSupplies()) do
                 print(string.format("  %-18s %d", name, count))
             end
+
+        elseif cmd == "setdump" then
+            local c = parseCoords(parts[2], parts[3], parts[4])
+            if c then
+                DUMP_CHEST = c saveConfig() broadcastConfig()
+                print(string.format("[CFG]    Dump chest set to (%d,%d,%d).", c.x, c.y, c.z))
+            else print("Usage: setdump x y z") end
+
+        elseif cmd == "setbase" then
+            local c = parseCoords(parts[2], parts[3], parts[4])
+            if c then
+                BASE_CHEST = c saveConfig() broadcastConfig()
+                print(string.format("[CFG]    Base chest set to (%d,%d,%d).", c.x, c.y, c.z))
+            else print("Usage: setbase x y z") end
+
+        elseif cmd == "coords" then
+            print(string.format("  Dump: (%d,%d,%d)", DUMP_CHEST.x, DUMP_CHEST.y, DUMP_CHEST.z))
+            print(string.format("  Base: (%d,%d,%d)", BASE_CHEST.x, BASE_CHEST.y, BASE_CHEST.z))
+
+        elseif cmd == "want" then
+            if parts[2] then WANT_LIST[parts[2]] = true saveConfig()
+                print("[CFG]    Now fetching: " .. parts[2])
+            else print("Usage: want <ore>") end
+
+        elseif cmd == "unwant" then
+            if parts[2] then WANT_LIST[parts[2]] = nil saveConfig()
+                print("[CFG]    No longer fetching: " .. parts[2])
+            else print("Usage: unwant <ore>") end
+
+        elseif cmd == "wants" then
+            write("  Fetching: ")
+            local any = false
+            for ore in pairs(WANT_LIST) do write(ore .. " ") any = true end
+            print(any and "" or "(nothing)")
+
+        elseif cmd == "help" then
+            printHelp()
+
+        elseif cmd and cmd ~= "" then
+            print("Unknown command: " .. cmd .. "   (type help)")
         end
     end
 end
@@ -196,14 +306,17 @@ local modem = peripheral.find("modem")
 if not modem then error("[FATAL] No modem found. Attach an Ender Modem and reboot.", 0) end
 rednet.open(peripheral.getName(modem))
 
+loadConfig()   -- restore any chest coords / want-list typed in a previous session
+
 print("+------------------------------------------+")
 print("|   M-NET V3  --  OVERSEER (FLEET COMMAND)  |")
 print("+------------------------------------------+")
 print("  Computer ID : " .. os.getComputerID())
+print("  Dump chest  : (" .. DUMP_CHEST.x .. ", " .. DUMP_CHEST.y .. ", " .. DUMP_CHEST.z .. ")")
 print("  Base chest  : (" .. BASE_CHEST.x .. ", " .. BASE_CHEST.y .. ", " .. BASE_CHEST.z .. ")")
 print("  Warehouse   : " .. (vault and "linked" or "no chest found"))
 print("")
-print("  Commands: start | stop | status")
+print("  Type  help  for the full command list.")
 print("  Waiting for miners to enlist...")
 print("")
 
