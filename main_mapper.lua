@@ -160,48 +160,80 @@ local ORE_FEED_MAX = 8
 -- Auto-saves every 60 seconds and on any clean shutdown.
 -- ============================================================
 local MAP_FILE      = "mnet_map.dat"
-local map_dirty     = false   -- true when unsaved changes exist
+local map_dirty     = false
 local last_map_save = 0
 
+-- Map file format: one voxel per line, tab-separated:
+--   x\ty\tz\tname
+-- This is ~4x more compact than textutils.serialize and streams
+-- line by line so CC's disk limit is never hit in one write call.
+-- Stone-class blocks are skipped entirely since they are the default
+-- assumption and take up ~90% of the data for zero nav benefit.
+
+-- What is worth persisting to disk:
+--   AIR    = yes, these mark dug tunnels the navigator needs to find
+--   ORES   = yes, these are dispatch targets
+--   HAZARDS (lava/water) = yes, the navigator avoids these
+--   CHESTS/COMPUTERS = yes, protected blocks the nav must route around
+--   STONE and all common rock = NO, navigator assumes solid by default
+--   so storing it wastes space for zero benefit
+local function shouldStore(name)
+    if not name or name == "" then return false end
+    if name:find("air")          then return true  end  -- tunnel corridor
+    if name:find("_ore")         then return true  end  -- ore targets
+    if name:find("lava")         then return true  end  -- hazard
+    if name:find("water")        then return true  end  -- hazard
+    if name:find("chest")        then return true  end  -- protected
+    if name:find("computer")     then return true  end  -- protected
+    if name:find("turtle")       then return true  end  -- protected
+    -- Everything else (stone, deepslate, granite, dirt, gravel...)
+    -- is assumed solid by the navigator already. Skip it.
+    return false
+end
+
 local function saveMap()
-    -- Flatten the 3D table into a list of {x,y,z,name} entries.
-    -- textutils.serialize handles nested tables fine but is slow on huge maps;
-    -- a flat list is both faster to write and to reload.
-    local entries = {}
+    local f = fs.open(MAP_FILE, "w")
+    if not f then
+        print("[MAP]    ERROR: could not open map file for writing.")
+        return
+    end
+    local count = 0
     for y, xt in pairs(master_voxels) do
         for x, zt in pairs(xt) do
             for z, name in pairs(zt) do
-                entries[#entries+1] = {x=x,y=y,z=z,n=name}
+                if shouldStore(name) then
+                    f.writeLine(x.."\t"..y.."\t"..z.."\t"..name)
+                    count = count + 1
+                end
             end
         end
     end
-    local f = fs.open(MAP_FILE, "w")
-    if f then
-        f.write(textutils.serialize(entries))
-        f.close()
-        map_dirty = false
-        last_map_save = os.epoch("utc")
-    end
+    f.close()
+    map_dirty     = false
+    last_map_save = os.epoch("utc")
+    print(string.format("[MAP]    Saved %d entries (of %d voxels) to disk.", count, total_voxels))
 end
 
 local function loadMap()
     if not fs.exists(MAP_FILE) then return end
     local f = fs.open(MAP_FILE, "r")
     if not f then return end
-    local data = textutils.unserialize(f.readAll() or "")
-    f.close()
-    if type(data) ~= "table" then return end
     local count = 0
-    for _, e in ipairs(data) do
-        if type(e)=="table" and e.x and e.y and e.z and e.n then
-            if not master_voxels[e.y] then master_voxels[e.y]={} end
-            if not master_voxels[e.y][e.x] then master_voxels[e.y][e.x]={} end
-            master_voxels[e.y][e.x][e.z] = e.n
+    local line  = f.readLine()
+    while line do
+        local x, y, z, name = line:match("^(-?%d+)\t(-?%d+)\t(-?%d+)\t(.+)$")
+        if x then
+            x = tonumber(x); y = tonumber(y); z = tonumber(z)
+            if not master_voxels[y]    then master_voxels[y]    = {} end
+            if not master_voxels[y][x] then master_voxels[y][x] = {} end
+            master_voxels[y][x][z] = name
             count = count + 1
         end
+        line = f.readLine()
     end
-    total_voxels = count
-    print(string.format("[MAP]    Loaded %d voxels from disk.", count))
+    f.close()
+    total_voxels = total_voxels + count
+    print(string.format("[MAP]    Loaded %d entries from disk.", count))
 end
 
 -- ============================================================
@@ -252,6 +284,10 @@ end
 -- VOXEL DATABASE
 -- ============================================================
 local function setVoxel(x, y, z, name)
+    -- Never store stone-class blocks in RAM. The navigator already treats
+    -- unknown as solid, so storing stone is wasted memory and disk space.
+    -- Only ores, air, hazards, and protected blocks are worth tracking.
+    if not shouldStore(name) then return end
     if not master_voxels[y] then master_voxels[y] = {} end
     if not master_voxels[y][x] then master_voxels[y][x] = {} end
     if not master_voxels[y][x][z] then total_voxels = total_voxels + 1 end
