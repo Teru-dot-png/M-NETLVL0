@@ -75,7 +75,7 @@ local zone_log      = {}     -- zone_log[hwid] = { dir, offset, exhausted }
 local lane_counters = {      -- how many lanes assigned per direction
     [0]=0,[1]=0,[2]=0,[3]=0
 }
-local fleet
+local fleet = {}
 local park_claim_by_hwid = {}
 local park_claim_by_key  = {}
 
@@ -95,7 +95,7 @@ local function clearAllParkClaims()
 end
 
 local function isOccupiedByOtherFleet(pos, requester)
-    for hwid, f in pairs(fleet) do
+    for hwid, f in pairs(fleet or {}) do
         if hwid ~= requester and f.pos then
             local fp = f.pos
             if math.floor(fp.x or 0) == math.floor(pos.x)
@@ -244,7 +244,6 @@ end
 -- STATE
 -- ============================================================
 -- fleet[hwid] = { net_id, last_pulse, pos, status, dir, fuel, free }
-fleet      = {}
 local dir_index  = 0
 local fleet_slot = 0    -- increments per turtle enlisted, used for park slot assignment
 local ore_log    = {}
