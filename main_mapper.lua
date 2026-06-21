@@ -1222,30 +1222,6 @@ local function parseCoords(a, b, c)
     if x and y and z then return { x = x, y = y, z = z } end
     return nil
 end
-local function printHelp()
-    print("Commands:")
-    print("  start | stop | recall      deploy / halt / call home")
-    print("  status                     fleet + supplies")
-    print("  setdump x y z              set loot dump chest")
-    print("  setbase x y z              set emergency coal chest")
-    print("  setpark x1 y1 z1 x2 y2 z2 define parking rectangle")
-    print("  coords                     show chest + park coords")
-    print("  want <ore>                 add ore to auto-fetch list")
-    print("  unwant <ore>               remove from auto-fetch list")
-    print("  wants                      show auto-fetch list")
-    print("  getme <ore> <count>        dispatch fleet to collect N ore")
-    print("    e.g.  getme diamond 128")
-    print("  orders                     show active getme orders")
-    print("  cancelorder <ore>          cancel a getme order")
-    print("  zones                      show tunnel lane assignments")
-    print("  newrun <hwid>              give a parked turtle a fresh lane")
-    print("  map                        voxel map stats")
-    print("  savemap                    force-save map to disk")
-    print("  clearmap                   wipe the voxel map")
-    print("  feed                       show last 8 ore finds")
-    print("  help                       this list")
-end
-
 local function terminalThread()
     while true do
         local parts = splitWords(read())
@@ -1460,6 +1436,30 @@ local function terminalThread()
                 print("  Mark two opposite corners of the parking rectangle.")
                 print("  e.g. setpark 130 0 -320  145 0 -320")
             end
+
+        -- !! HELP IS INLINE HERE ON PURPOSE so it cannot be accidentally
+        -- !! lost when adding new commands. Do not move it to a function.
+        elseif cmd == "help" then
+            print("Commands:")
+            print("  start | stop | recall      deploy / halt / call home")
+            print("  status                     fleet + supplies")
+            print("  setdump x y z              set loot dump chest")
+            print("  setbase x y z              set emergency coal chest")
+            print("  setpark x1 y1 z1 x2 y2 z2 define parking rectangle")
+            print("  coords                     show chest + park coords")
+            print("  want <ore>                 add to auto-fetch list")
+            print("  unwant <ore>               remove from auto-fetch list")
+            print("  wants                      show auto-fetch list")
+            print("  getme <ore> <count>        e.g. getme diamond 128")
+            print("  orders                     show active getme orders")
+            print("  cancelorder <ore>          cancel a getme order")
+            print("  zones                      show tunnel lane assignments")
+            print("  newrun <hwid>              give parked turtle a fresh lane")
+            print("  map                        voxel map stats")
+            print("  savemap                    force-save map to disk")
+            print("  clearmap                   wipe the voxel map")
+            print("  feed                       last 8 ore finds")
+            print("  help                       this list")
 
         elseif cmd and cmd ~= "" then
             print("Unknown command: " .. cmd)
