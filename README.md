@@ -94,6 +94,20 @@ Copy `main_mapper.lua` to the overseer computer.
 
 Copy `scout_node.lua` to every miner turtle.
 
+Fast install via wget:
+
+Overseer computer:
+
+```sh
+wget https://raw.githubusercontent.com/Teru-dot-png/M-NETLVL0/refs/heads/main/main_mapper.lua startup.lua
+```
+
+Miner turtle:
+
+```sh
+wget https://raw.githubusercontent.com/Teru-dot-png/M-NETLVL0/refs/heads/main/scout_node.lua startup.lua
+```
+
 Recommended startup files:
 
 Overseer `startup`:

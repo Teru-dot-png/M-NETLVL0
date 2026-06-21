@@ -793,6 +793,8 @@ local function renderMap(first_row, last_row, map_col_start, map_col_end)
                         local vn = getVoxel(world_x, view_y - d, world_z)
                         if vn == AIR_MARKER then
                             saw_known_air = true
+                            -- Tunnel air at this column should win over deeper rock.
+                            break
                         elseif not isAir(vn) then
                             local bc, bfg = renderCell(vn, d)
                             ch, fg = bc, c2b(bfg)
@@ -813,6 +815,8 @@ local function renderMap(first_row, last_row, map_col_start, map_col_end)
                     local vn = getVoxel(world_x, view_y - d, world_z)
                     if vn == AIR_MARKER then
                         saw_known_air = true
+                        -- Tunnel air at this column should win over deeper rock.
+                        break
                     elseif not isAir(vn) then
                         local tc, tfg = renderCell(vn, d)
                         ch, fg = tc, c2b(tfg)
@@ -1207,6 +1211,46 @@ local function handleGeoData(msg)
                     setVoxel(ax, ay, az, AIR_MARKER)
                 else
                     setVoxel(ax, ay, az, b.name)
+                end
+            end
+        end
+
+        -- Geo scanner typically reports non-air blocks only.
+        -- If a block inside this scan radius is no longer reported, treat
+        -- previously known in-range solids as air (dug/opened space).
+        local radius = floor(tonumber(msg.scan_radius) or 0)
+        if radius > 0 then
+            local seen = {}
+            for _, b in ipairs(scan) do
+                if type(b) == "table" and type(b.name) == "string" and not isAir(b.name) then
+                    local sx = floor(ox + (b.x or 0))
+                    local sy = floor(oy + (b.y or 0))
+                    local sz = floor(oz + (b.z or 0))
+                    seen[sx..":"..sy..":"..sz] = true
+                end
+            end
+
+            local r2 = radius * radius
+            for y, xt in pairs(master_voxels) do
+                if y >= (oy - radius) and y <= (oy + radius) then
+                    for x, zt in pairs(xt) do
+                        if x >= (ox - radius) and x <= (ox + radius) then
+                            for z, name in pairs(zt) do
+                                if z >= (oz - radius) and z <= (oz + radius) then
+                                    local dx = x - ox
+                                    local dy = y - oy
+                                    local dz = z - oz
+                                    if (dx*dx + dy*dy + dz*dz) <= r2 then
+                                        local k = x..":"..y..":"..z
+                                        if not seen[k] and not isAir(name) then
+                                            zt[z] = AIR_MARKER
+                                            map_dirty = true
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
                 end
             end
         end

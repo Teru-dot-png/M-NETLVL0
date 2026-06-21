@@ -1244,9 +1244,10 @@ local function sendSnapshot(scan)
         local n=b.name or ""
         if n~="" and not n:find("air") then solids[#solids+1]={x=b.x,y=b.y,z=b.z,name=n} end
     end
-    if #solids>0 then
-        pcall(rednet.send,server_id,{type="GEO_DATA",hwid=hwid,pos=copy(pos),scan_data=solids},PROTOCOL)
-    end
+    pcall(rednet.send,server_id,{
+        type="GEO_DATA", hwid=hwid, pos=copy(pos),
+        scan_data=solids, scan_radius=SCAN_RADIUS,
+    },PROTOCOL)
 end
 
 -- ============================================================
