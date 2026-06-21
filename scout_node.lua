@@ -209,35 +209,56 @@ local function liveInspect()
 end
 
 -- ============================================================
--- PICKAXE DETECTION
+-- PICKAXE / MODEM SLOT DETECTION
+-- The modem can be on left OR right. The pickaxe goes on the
+-- other side. We detect which is which at runtime.
 -- ============================================================
--- Returns true only if we are confident the left slot holds a pickaxe.
--- Strategy:
---   1. If the left slot is a peripheral (scanner), it is definitely NOT a pickaxe.
---   2. Try turtle.getEquippedLeft() if it exists (CC:T 1.109+).
---   3. Fall back to turtle.inspect() in front: if dig succeeds on a known-stone
---      block we know the pickaxe is there. Otherwise use a simpler heuristic.
-local function pickaxeEquipped()
-    -- A peripheral on the left means the scanner is there, not the pickaxe.
-    if peripheral.wrap("left") ~= nil then return false end
 
-    -- CC:Tweaked 1.109+ exposes getEquippedLeft()
-    if turtle.getEquippedLeft then
-        local info = turtle.getEquippedLeft()
-        -- nil means empty slot
-        if info == nil then return false end
-        return tostring(info.name or ""):find("pickaxe") ~= nil
-    end
+-- Returns "left", "right", or nil depending on which side has the modem.
+local function modemSide()
+    if peripheral.wrap("left")  and peripheral.getType("left")  == "modem" then return "left"  end
+    if peripheral.wrap("right") and peripheral.getType("right") == "modem" then return "right" end
+    -- Ender modem may report a different type string; check both sides for any modem.
+    if peripheral.wrap("left")  then return "left"  end
+    if peripheral.wrap("right") then return "right" end
+    return nil
+end
 
-    -- Older CC:T: the left slot is either a pickaxe or empty.
-    -- We cannot distinguish without trying to dig; accept the ambiguity
-    -- and treat non-peripheral left as having the pickaxe.
-    -- The first actual dig attempt will expose an empty slot immediately.
-    return true
+-- The pickaxe side is whichever side does NOT have the modem.
+local function pickaxeSide()
+    local ms = modemSide()
+    if ms == "left"  then return "right" end
+    if ms == "right" then return "left"  end
+    return "left"   -- no modem found: default to left
 end
 
 local function leftIsPeripheral()
     return peripheral.wrap("left") ~= nil
+end
+
+-- Returns true if the pickaxe side currently holds a pickaxe (not a peripheral).
+local function pickaxeEquipped()
+    local pside = pickaxeSide()
+    -- If the pickaxe side has a peripheral on it, it is NOT a pickaxe.
+    if peripheral.wrap(pside) ~= nil then return false end
+    -- CC:T 1.109+ exposes getEquippedLeft / getEquippedRight
+    local getEquipped = pside == "left" and turtle.getEquippedLeft or turtle.getEquippedRight
+    if getEquipped then
+        local info = getEquipped()
+        if info == nil then return false end
+        return tostring(info.name or ""):find("pickaxe") ~= nil
+    end
+    -- Older CC:T: non-peripheral side assumed to hold the pickaxe.
+    return true
+end
+
+-- Equip item from the currently selected slot onto the pickaxe side.
+local function equipOnPickaxeSide()
+    if pickaxeSide() == "left" then
+        return turtle.equipLeft()
+    else
+        return turtle.equipRight()
+    end
 end
 
 -- ============================================================
@@ -374,20 +395,36 @@ local function forward()
 end
 
 -- ============================================================
--- A* PATHFINDER
--- Plans through the world cache. Unknown = assume diggable stone.
--- Protected blocks = infinite cost (never entered).
--- Returns a list of step tables { dx, dy, dz, dir } or nil.
+-- NAVIGATION CORE  (refactored)
 -- ============================================================
+-- Philosophy: move greedily toward the goal using GPS as ground
+-- truth. Each step:
+--   1. Check the block ahead with inspect() BEFORE moving.
+--   2. If air -> move freely.
+--   3. If diggable stone/ore -> dig and move.
+--   4. If protected -> try a different axis.
+--   5. Only use A* for short-range detours (<=16 blocks) around
+--      a cluster of protected blocks.
+-- This means the turtle navigates ANY pre-dug tunnel instantly
+-- because it sees air, moves, no planning needed.
+-- Unknown blocks are treated as diggable (optimistic), which
+-- is correct for a mining turtle in natural terrain.
+-- ============================================================
+
+-- ── Cost function for the short-range A* detour only ──────
+-- Unknown = 1 (treat as air; we will discover it on arrival)
+-- Air     = 1
+-- Diggable= 3
+-- Protected/fluid = nil (never enter)
 local function navCost(nx, ny, nz)
     local name = cacheGet(nx, ny, nz)
-    if name == nil        then return 2  end  -- unknown: assume diggable, small penalty
+    if name == nil        then return 1  end  -- unknown: assume passable
     if isPassable(name)   then return 1  end  -- air: free
-    if isDiggable(name)   then return 4  end  -- rock: costs a dig
-    return nil                                -- protected or fluid: impassable
+    if isDiggable(name)   then return 3  end  -- stone: costs a dig
+    return nil                                -- protected: never enter
 end
 
--- Tiny binary min-heap
+-- ── Tiny binary min-heap ──────────────────────────────────
 local function newHeap() return { n = 0 } end
 local function heapPush(h, node, pri)
     local i = h.n + 1; h.n = i; h[i] = { node = node, p = pri }
@@ -412,171 +449,190 @@ local function heapPop(h)
 end
 
 local DIRS6 = {
-    { dx=0, dy=0, dz=-1, dir=0  },   -- N
-    { dx=1, dy=0, dz=0,  dir=1  },   -- E
-    { dx=0, dy=0, dz=1,  dir=2  },   -- S
-    { dx=-1,dy=0, dz=0,  dir=3  },   -- W
-    { dx=0, dy=1, dz=0,  dir=-1 },   -- up
-    { dx=0, dy=-1,dz=0,  dir=-2 },   -- down
+    {dx=0,dy=0,dz=-1,dir=0},{dx=1,dy=0,dz=0,dir=1},
+    {dx=0,dy=0,dz=1,dir=2},{dx=-1,dy=0,dz=0,dir=3},
+    {dx=0,dy=1,dz=0,dir=-1},{dx=0,dy=-1,dz=0,dir=-2},
 }
 
-local function astar(start, goal)
-    local dist = math.abs(start.x-goal.x)+math.abs(start.y-goal.y)+math.abs(start.z-goal.z)
-    if dist == 0 then return {} end
-    if dist > NAV_MAX_RANGE then
-        log("NAV", string.format("Goal %d blocks away, exceeds NAV_MAX_RANGE=%d.", dist, NAV_MAX_RANGE))
-        return nil
+-- Short-range A* for detours around obstacles (max 16 block radius).
+local DETOUR_BUDGET = 512
+local function astarLocal(start, goal)
+    local function h(n)
+        return math.abs(n.x-goal.x)+math.abs(n.y-goal.y)+math.abs(n.z-goal.z)
     end
-
-    local function h(n) return math.abs(n.x-goal.x)+math.abs(n.y-goal.y)+math.abs(n.z-goal.z) end
-
-    local open   = newHeap()
-    local g_cost = {}   -- g_cost[k] = best g-score
-    local came   = {}   -- came[k] = { pk=parentKey, step=actionTable }
-    local sk     = key(start)
-
+    local open = newHeap()
+    local g_cost, came = {}, {}
+    local sk = key(start)
     g_cost[sk] = 0
     heapPush(open, start, h(start))
-
     local expanded = 0
     while open.n > 0 do
         local cur = heapPop(open)
         local ck  = key(cur)
         expanded  = expanded + 1
-
-        if expanded > NAV_MAX_NODES then
-            log("NAV", string.format("A* budget exhausted (%d nodes). Partial cache; will replan on move.", expanded))
-            return nil
-        end
-
-        if cur.x == goal.x and cur.y == goal.y and cur.z == goal.z then
-            -- Reconstruct
-            local path = {}
-            local k = ck
-            while came[k] do
-                table.insert(path, 1, came[k].step)
-                k = came[k].pk
-            end
-            log("NAV", string.format("Path: %d steps via %d nodes expanded.", #path, expanded))
+        if expanded > DETOUR_BUDGET then return nil end
+        if cur.x==goal.x and cur.y==goal.y and cur.z==goal.z then
+            local path, k = {}, ck
+            while came[k] do table.insert(path,1,came[k].step); k=came[k].pk end
             return path
         end
-
         local g = g_cost[ck]
         for _, nb in ipairs(DIRS6) do
-            local nx, ny, nz = cur.x+nb.dx, cur.y+nb.dy, cur.z+nb.dz
-            local nc = navCost(nx, ny, nz)
+            local nx,ny,nz = cur.x+nb.dx, cur.y+nb.dy, cur.z+nb.dz
+            local nc = navCost(nx,ny,nz)
             if nc then
                 local nk = nx..":"..ny..":"..nz
                 local ng = g + nc
                 if not g_cost[nk] or ng < g_cost[nk] then
                     g_cost[nk] = ng
-                    came[nk] = { pk = ck, step = { dx=nb.dx, dy=nb.dy, dz=nb.dz, dir=nb.dir } }
-                    heapPush(open, {x=nx,y=ny,z=nz}, ng + h({x=nx,y=ny,z=nz}))
+                    came[nk] = { pk=ck, step={dx=nb.dx,dy=nb.dy,dz=nb.dz,dir=nb.dir} }
+                    heapPush(open, {x=nx,y=ny,z=nz}, ng+h({x=nx,y=ny,z=nz}))
                 end
             end
         end
     end
-
-    log("NAV", "A*: no path found (all routes blocked by protected blocks or lava).")
     return nil
 end
 
--- ============================================================
--- PATH EXECUTOR
--- Executes a list of steps from astar(). Re-plans up to 5 times
--- if a step fails because the world differed from the cached model.
--- ============================================================
-local function executePath(path, goal)
-    local replans = 0
-    local MAX_REPLANS = 5
-
-    while #path > 0 do
-        local step = table.remove(path, 1)
+-- Execute a short A* path (used only for local detours).
+local function executeDetour(path, goal)
+    for _, step in ipairs(path) do
         local ok
-
-        if step.dy == 1 then
-            ok = stepUp()
-        elseif step.dy == -1 then
-            ok = stepDown()
-        else
-            face(step.dir)
-            ok = stepForward()
-        end
-
-        if not ok then
-            replans = replans + 1
-            log("NAV", string.format("Step failed (replan %d/%d). Updating cache...", replans, MAX_REPLANS))
-            liveInspect()
-
-            if replans > MAX_REPLANS then
-                log("NAV", "Max replans exceeded. Giving up.")
-                return false
-            end
-
-            path = astar(pos, goal)
-            if not path then
-                log("NAV", "Re-plan produced no path.")
-                return false
-            end
-            log("NAV", string.format("Re-planned: %d steps remaining.", #path))
-        end
-
-        -- Yield so heartbeat + listener threads stay alive
+        if     step.dy ==  1 then ok = stepUp()
+        elseif step.dy == -1 then ok = stepDown()
+        else face(step.dir);  ok = stepForward() end
+        if not ok then return false end
         sleep(0)
     end
-
-    return pos.x == goal.x and pos.y == goal.y and pos.z == goal.z
+    return pos.x==goal.x and pos.y==goal.y and pos.z==goal.z
 end
 
--- ============================================================
--- moveTo  (the only navigation entry point used by all other code)
--- ============================================================
-function moveTo(goal)
-    if pos.x == goal.x and pos.y == goal.y and pos.z == goal.z then return true end
+-- ── GREEDY AXIS NAVIGATOR ────────────────────────────────
+-- Move one step along the axis that reduces Manhattan distance
+-- the most. Inspect first; dig if diggable; detour if protected.
+-- Returns "moved", "stuck", or "arrived".
+local function greedyStep(goal)
+    if pos.x==goal.x and pos.y==goal.y and pos.z==goal.z then return "arrived" end
 
-    log("NAV", string.format("Route to (%d,%d,%d) from (%d,%d,%d)...",
+    -- Build a priority list: try the largest delta axis first.
+    local dx = goal.x - pos.x
+    local dy = goal.y - pos.y
+    local dz = goal.z - pos.z
+    local axes = {
+        { math.abs(dx), dx~=0 and (dx>0 and 1 or 3) or nil, "h" },
+        { math.abs(dz), dz~=0 and (dz>0 and 2 or 0) or nil, "h" },
+        { math.abs(dy), nil, dy>0 and "u" or "d" },
+    }
+    table.sort(axes, function(a,b) return a[1]>b[1] end)
+
+    for _, ax in ipairs(axes) do
+        if ax[1] > 0 then
+            local ok = false
+            if ax[3] == "u" then
+                ok = stepUp()
+            elseif ax[3] == "d" then
+                ok = stepDown()
+            else
+                face(ax[2])
+                -- Inspect before committing
+                local ok_i, dat_i = turtle.inspect()
+                if ok_i and type(dat_i)=="table" then
+                    local name = dat_i.name or ""
+                    cacheSet(pos.x+DIRV[facing].dx, pos.y, pos.z+DIRV[facing].dz, name)
+                    if not isPassable(name) and not isDiggable(name) then
+                        -- Protected block on best axis; skip to next axis
+                        log("NAV", "Protected ["..name.."] on best axis. Trying next axis.")
+                        goto continue
+                    end
+                end
+                ok = stepForward()
+            end
+            if ok then return "moved" end
+        end
+        ::continue::
+    end
+    return "stuck"
+end
+
+-- ── MAIN moveTo ──────────────────────────────────────────
+-- Greedy navigation with local A* detours for obstacles.
+-- Never gives up on a long tunnel: just keeps stepping.
+function moveTo(goal)
+    if pos.x==goal.x and pos.y==goal.y and pos.z==goal.z then return true end
+
+    log("NAV", string.format("Nav to (%d,%d,%d) from (%d,%d,%d)",
         goal.x, goal.y, goal.z, pos.x, pos.y, pos.z))
 
-    -- Seed cache with a scan if goal is nearby and scanner is ready
-    local dist = math.abs(pos.x-goal.x)+math.abs(pos.y-goal.y)+math.abs(pos.z-goal.z)
-    if dist <= SCAN_RADIUS * 2 and has_scanner and not leftIsPeripheral() then
-        log("NAV", "Goal in scan range. Scanning to seed world cache...")
-        -- inline scan so we don't call scanAround recursively
-        if turtle.getItemCount(SCANNER_SLOT) > 0 then
-            turtle.select(SCANNER_SLOT)
-            turtle.equipLeft()
-            local sc = peripheral.wrap("left")
-            if sc and sc.scan then
-                local ok, r = pcall(sc.scan, SCAN_RADIUS)
-                if ok and type(r) == "table" then feedCache(r, pos) end
+    local stuck_count = 0
+    local MAX_STUCK   = 6      -- consecutive stuck steps before trying A* detour
+    local MAX_DETOURS = 8      -- total detours before giving up
+    local detours     = 0
+    local last_pos    = nil
+
+    while pos.x~=goal.x or pos.y~=goal.y or pos.z~=goal.z do
+
+        -- Check for CMD_RECALL mid-journey
+        if home_requested then return false end
+
+        liveInspect()
+        local result = greedyStep(goal)
+
+        if result == "arrived" then
+            break
+        elseif result == "moved" then
+            stuck_count = 0
+            last_pos    = copy(pos)
+            sleep(0)
+        else
+            stuck_count = stuck_count + 1
+            log("NAV", string.format("Stuck step %d/%d at (%d,%d,%d)",
+                stuck_count, MAX_STUCK, pos.x, pos.y, pos.z))
+
+            if stuck_count >= MAX_STUCK then
+                stuck_count = 0
+                detours     = detours + 1
+                log("NAV", string.format("Trying A* detour %d/%d...", detours, MAX_DETOURS))
+
+                -- Scan to populate the local cache before planning
+                if has_scanner then
+                    local snap = scanAround()
+                    feedCache(snap, pos)
+                end
+
+                -- Plan a short detour to a waypoint 3 blocks past the goal
+                -- in the goal direction, to get around whatever is blocking
+                local path = astarLocal(pos, goal)
+                if path and #path > 0 then
+                    log("NAV", string.format("Detour: %d steps.", #path))
+                    if not executeDetour(path, goal) then
+                        log("NAV", "Detour execution failed. Retrying greedy.")
+                    end
+                else
+                    log("NAV", "A* detour found no path. All routes protected or blocked.")
+                    if detours >= MAX_DETOURS then
+                        log("NAV", "Max detours reached. Reporting STUCK.")
+                        pcall(rednet.send, server_id, {
+                            type = "ALERT", hwid = hwid,
+                            msg  = string.format("STUCK at (%d,%d,%d) -> (%d,%d,%d)",
+                                pos.x, pos.y, pos.z, goal.x, goal.y, goal.z),
+                            pos  = copy(pos),
+                        }, PROTOCOL)
+                        return false
+                    end
+                    -- Wait and retry; something might clear
+                    sleep(2)
+                end
+            else
+                sleep(0.3)
             end
-            turtle.select(SCANNER_SLOT)
-            turtle.equipLeft()
-            turtle.select(1)
         end
     end
 
-    local path = astar(pos, goal)
-    if not path then
-        log("NAV", "No initial path found. Reporting STUCK.")
-        pcall(rednet.send, server_id, {
-            type = "ALERT", hwid = hwid,
-            msg  = string.format("STUCK: no path to (%d,%d,%d)", goal.x, goal.y, goal.z),
-            pos  = copy(pos),
-        }, PROTOCOL)
-        return false
+    local arrived = pos.x==goal.x and pos.y==goal.y and pos.z==goal.z
+    if arrived then
+        log("NAV", string.format("Arrived at (%d,%d,%d).", goal.x, goal.y, goal.z))
     end
-
-    local reached = executePath(path, goal)
-    if not reached then
-        log("NAV", "Could not reach goal after replans.")
-        pcall(rednet.send, server_id, {
-            type = "ALERT", hwid = hwid,
-            msg  = string.format("STUCK mid-path to (%d,%d,%d)", goal.x, goal.y, goal.z),
-            pos  = copy(pos),
-        }, PROTOCOL)
-    end
-    return reached
+    return arrived
 end
 
 -- ============================================================
@@ -637,7 +693,7 @@ local function fetchPickaxeFromBase(resumePos)
                                 local got = turtle.getItemDetail(ts)
                                 if got and isEquippable(got) then
                                     turtle.select(ts)
-                                    turtle.equipLeft()
+                                    equipOnPickaxeSide()
                                     if pickaxeEquipped() then
                                         log("PICK", "Pickaxe equipped. OK")
                                         turtle.select(1)
@@ -665,7 +721,7 @@ local function fetchPickaxeFromBase(resumePos)
                     if not turtle.suckDown(1) then break end
                     local got = turtle.getItemDetail(ts)
                     if got and isEquippable(got) then
-                        turtle.equipLeft()
+                        equipOnPickaxeSide()
                         if pickaxeEquipped() then
                             log("PICK", "Pickaxe equipped (fallback). OK")
                             turtle.select(1)
@@ -707,44 +763,36 @@ local function checkPickaxeAtBoot()
         return true
     end
 
-    -- If something is on the left (scanner), unequip it to a free slot first.
-    if leftIsPeripheral() then
-        log("INIT", "Scanner on left. Moving it to free slot before equipping pickaxe...")
+    -- If something is on the pickaxe side (scanner), unequip it to a free slot first.
+    local pside = pickaxeSide()
+    if peripheral.wrap(pside) ~= nil then
+        log("INIT", "Peripheral on " .. pside .. " side. Moving to free slot...")
         for s = 1, 16 do
             if turtle.getItemCount(s) == 0 then
                 turtle.select(s)
-                turtle.equipLeft()   -- scanner goes into slot s
-                log("INIT", "Scanner moved to slot " .. s)
+                if pside == "left" then turtle.equipLeft() else turtle.equipRight() end
+                log("INIT", "Peripheral moved to slot " .. s)
                 break
             end
         end
     end
 
-    -- Now search all slots for a pickaxe.
-    log("INIT", "Searching all slots for a pickaxe...")
+    -- Now search all slots for an equippable pickaxe.
+    log("INIT", "Searching all slots for a fresh pickaxe...")
     for s = 1, 16 do
         local detail = turtle.getItemDetail(s)
         if detail and tostring(detail.name or ""):find("pickaxe") then
-            log("INIT", string.format("Pickaxe in slot %d (%s). Equipping...", s, detail.name))
-            turtle.select(s)
-            turtle.equipLeft()
-            -- Whatever came off the left lands in slot s now.
-            -- If it is the scanner, move it to SCANNER_SLOT.
-            local swapped = turtle.getItemDetail(s)
-            if swapped and tostring(swapped.name or ""):find("scanner") then
-                if s ~= SCANNER_SLOT then
-                    -- Swap it to the dedicated slot if possible.
-                    if turtle.getItemCount(SCANNER_SLOT) == 0 then
-                        turtle.select(s)
-                        -- transferTo is not available; just leave it, scanAround handles any slot.
-                        log("INIT", "Scanner landed in slot " .. s .. " (not slot 16, scan still works).")
-                    end
+            if not isEquippable(detail) then
+                log("INIT", string.format("Slot %d: pickaxe rejected (damaged/enchanted). Need a fresh one.", s))
+            else
+                log("INIT", string.format("Pickaxe in slot %d. Equipping on %s side...", s, pside))
+                turtle.select(s)
+                equipOnPickaxeSide()
+                if pickaxeEquipped() then
+                    log("INIT", "Pickaxe equipped. OK")
+                    turtle.select(1)
+                    return true
                 end
-            end
-            if pickaxeEquipped() then
-                log("INIT", "Pickaxe equipped. OK")
-                turtle.select(1)
-                return true
             end
         end
     end
@@ -895,43 +943,47 @@ end
 -- ============================================================
 -- GEO SCAN: hot-swap pickaxe <-> scanner on left slot
 -- ============================================================
+-- GEO SCAN: hot-swap pickaxe <-> scanner on the pickaxe side
+-- The scanner goes onto whichever side does NOT have the modem.
+-- ============================================================
 local function scanAround()
     if not has_scanner then return {} end
 
-    local scannerOnLeft = leftIsPeripheral()
+    local pside = pickaxeSide()
+    local scannerAlreadyOn = peripheral.wrap(pside) ~= nil
 
-    if not scannerOnLeft then
+    if not scannerAlreadyOn then
         if turtle.getItemCount(SCANNER_SLOT) == 0 then
             log("SCAN", "Scanner item missing from slot 16. Skipping scan.")
             return {}
         end
         turtle.select(SCANNER_SLOT)
-        turtle.equipLeft()   -- scanner to left, pickaxe to slot 16
+        -- Equip scanner onto the pickaxe side; pickaxe goes into slot 16.
+        if pside == "left" then turtle.equipLeft() else turtle.equipRight() end
     end
 
     local results = {}
-    local sc = peripheral.wrap("left")
+    local sc = peripheral.wrap(pside)
     if sc and sc.scan then
         local ok, r = pcall(sc.scan, SCAN_RADIUS)
         if ok and type(r) == "table" then
             results = r
-            -- Feed world model so A* knows what is around us
             feedCache(results, pos)
             log("SCAN", string.format("Scanned %d blocks. Cache: %d entries.", #results, cache_size))
         else
             log("SCAN", "Scan error: " .. tostring(r))
         end
     else
-        log("SCAN", "No scanner peripheral on left after swap.")
+        log("SCAN", "No scanner peripheral on " .. pside .. " after swap.")
     end
 
-    -- Always swap back regardless of scan success
+    -- Swap back: pickaxe is in slot 16, put it back on the pickaxe side.
     turtle.select(SCANNER_SLOT)
-    turtle.equipLeft()   -- pickaxe back to left, scanner to slot 16
+    if pside == "left" then turtle.equipLeft() else turtle.equipRight() end
     turtle.select(1)
 
     if not pickaxeEquipped() then
-        log("WARN", "Pickaxe not restored after scan swap. Correcting next move.")
+        log("WARN", "Pickaxe not restored after scan swap.")
     end
 
     return results
@@ -1313,4 +1365,224 @@ log("BOOT", string.format(
     ({"N","E","S","W"})[facing+1]
 ))
 
-parallel.waitForAll(brainThread, listenerThread, heartbeatThread)
+-- ============================================================
+-- A* PATHFINDER
+-- Only called on a well-seeded cache (scan first, plan second).
+-- Unknown cells cost 2. Protected = impassable.
+-- ============================================================
+local function navCost(nx, ny, nz)
+    local name = cacheGet(nx, ny, nz)
+    if name == nil        then return 2  end
+    if isPassable(name)   then return 1  end
+    if isDiggable(name)   then return 4  end
+    return nil
+end
+
+local function newHeap() return { n = 0 } end
+local function heapPush(h, node, pri)
+    local i = h.n + 1; h.n = i; h[i] = { node = node, p = pri }
+    while i > 1 do
+        local p = math.floor(i / 2)
+        if h[p].p > h[i].p then h[p], h[i] = h[i], h[p]; i = p else break end
+    end
+end
+local function heapPop(h)
+    if h.n == 0 then return nil end
+    local top = h[1].node
+    h[1] = h[h.n]; h[h.n] = nil; h.n = h.n - 1
+    local i = 1
+    while true do
+        local l, r, s = i*2, i*2+1, i
+        if l <= h.n and h[l].p < h[s].p then s = l end
+        if r <= h.n and h[r].p < h[s].p then s = r end
+        if s == i then break end
+        h[i], h[s] = h[s], h[i]; i = s
+    end
+    return top
+end
+
+local DIRS6 = {
+    { dx=0,  dy=0,  dz=-1, dir=0  },
+    { dx=1,  dy=0,  dz=0,  dir=1  },
+    { dx=0,  dy=0,  dz=1,  dir=2  },
+    { dx=-1, dy=0,  dz=0,  dir=3  },
+    { dx=0,  dy=1,  dz=0,  dir=-1 },
+    { dx=0,  dy=-1, dz=0,  dir=-2 },
+}
+
+local function astar(start, goal, budget)
+    budget = budget or NAV_MAX_NODES
+    local dist = math.abs(start.x-goal.x)+math.abs(start.y-goal.y)+math.abs(start.z-goal.z)
+    if dist == 0 then return {} end
+    local function h(n)
+        return math.abs(n.x-goal.x)+math.abs(n.y-goal.y)+math.abs(n.z-goal.z)
+    end
+    local open = newHeap()
+    local g_cost, came = {}, {}
+    local sk = key(start)
+    g_cost[sk] = 0
+    heapPush(open, start, h(start))
+    local expanded = 0
+    while open.n > 0 do
+        local cur = heapPop(open)
+        local ck  = key(cur)
+        expanded  = expanded + 1
+        if expanded > budget then return nil end
+        if cur.x == goal.x and cur.y == goal.y and cur.z == goal.z then
+            local path = {}
+            local k = ck
+            while came[k] do table.insert(path, 1, came[k].step); k = came[k].pk end
+            log("NAV", string.format("Path: %d steps, %d nodes.", #path, expanded))
+            return path
+        end
+        local g = g_cost[ck]
+        for _, nb in ipairs(DIRS6) do
+            local nx, ny, nz = cur.x+nb.dx, cur.y+nb.dy, cur.z+nb.dz
+            local nc = navCost(nx, ny, nz)
+            if nc then
+                local nk = nx..":"..ny..":"..nz
+                local ng = g + nc
+                if not g_cost[nk] or ng < g_cost[nk] then
+                    g_cost[nk] = ng
+                    came[nk]   = { pk=ck, step={ dx=nb.dx, dy=nb.dy, dz=nb.dz, dir=nb.dir } }
+                    heapPush(open, {x=nx,y=ny,z=nz}, ng + h({x=nx,y=ny,z=nz}))
+                end
+            end
+        end
+    end
+    return nil
+end
+
+-- ============================================================
+-- SCAN-SEED: scan + live-inspect before every plan
+-- ============================================================
+local function seedCacheHere()
+    liveInspect()
+    if has_scanner and not peripheral.wrap(pickaxeSide()) then
+        scanAround()   -- scanAround calls feedCache internally
+    end
+end
+
+-- ============================================================
+-- PATH EXECUTOR
+-- ============================================================
+local function executePath(path, goal)
+    local replans, MAX_REPLANS = 0, 8
+    while #path > 0 do
+        local step = table.remove(path, 1)
+        local ok
+        if     step.dy ==  1 then ok = stepUp()
+        elseif step.dy == -1 then ok = stepDown()
+        else face(step.dir);  ok = stepForward() end
+
+        if not ok then
+            replans = replans + 1
+            log("NAV", string.format("Step failed (replan %d/%d). Scanning...", replans, MAX_REPLANS))
+            seedCacheHere()
+            if replans > MAX_REPLANS then log("NAV","Max replans."); return false end
+            path = astar(pos, goal)
+            if not path then log("NAV","Replan blocked."); return false end
+            log("NAV", string.format("Replanned: %d steps.", #path))
+        end
+        sleep(0)
+    end
+    return pos.x==goal.x and pos.y==goal.y and pos.z==goal.z
+end
+
+-- ============================================================
+-- moveTo  (scan-first waypoint navigator)
+-- Breaks long trips into SCAN_RADIUS-length legs.
+-- Scans at the start of each leg so A* always works on known terrain.
+-- Falls back to greedy one-step movement when A* cannot plan.
+-- ============================================================
+local WAYPOINT_STEP = SCAN_RADIUS
+
+local function greedyStep(goal)
+    local dx = goal.x - pos.x
+    local dy = goal.y - pos.y
+    local dz = goal.z - pos.z
+    -- Try the dominant axis first
+    if     math.abs(dy) >= math.abs(dx) and math.abs(dy) >= math.abs(dz) then
+        if dy > 0 and stepUp()   then return true end
+        if dy < 0 and stepDown() then return true end
+    elseif math.abs(dx) >= math.abs(dz) then
+        face(dx > 0 and 1 or 3)
+        if stepForward() then return true end
+    else
+        face(dz > 0 and 2 or 0)
+        if stepForward() then return true end
+    end
+    -- Try all 6 directions
+    for _, d in ipairs({0,1,2,3}) do face(d); if stepForward() then return true end end
+    if stepUp()   then return true end
+    if stepDown() then return true end
+    return false
+end
+
+function moveTo(goal)
+    if pos.x==goal.x and pos.y==goal.y and pos.z==goal.z then return true end
+
+    local function dist() return math.abs(pos.x-goal.x)+math.abs(pos.y-goal.y)+math.abs(pos.z-goal.z) end
+    local function alert(msg)
+        log("NAV", msg)
+        pcall(rednet.send, server_id, { type="ALERT", hwid=hwid, msg=msg, pos=copy(pos) }, PROTOCOL)
+    end
+
+    log("NAV", string.format("Navigate (%d,%d,%d) -> (%d,%d,%d) dist=%d",
+        pos.x, pos.y, pos.z, goal.x, goal.y, goal.z, dist()))
+
+    local leg = 0
+    while dist() > 0 do
+        leg = leg + 1
+        if leg > NAV_MAX_RANGE then
+            alert(string.format("STUCK: too many legs to (%d,%d,%d)", goal.x, goal.y, goal.z))
+            return false
+        end
+
+        local d = dist()
+
+        -- Scan here to seed cache before planning this leg
+        seedCacheHere()
+
+        -- Determine waypoint for this leg
+        local wp
+        if d <= WAYPOINT_STEP then
+            wp = goal
+        else
+            local ratio = WAYPOINT_STEP / d
+            wp = {
+                x = pos.x + math.floor((goal.x - pos.x) * ratio + 0.5),
+                y = pos.y + math.floor((goal.y - pos.y) * ratio + 0.5),
+                z = pos.z + math.floor((goal.z - pos.z) * ratio + 0.5),
+            }
+            -- Avoid planning to exact same pos
+            if wp.x==pos.x and wp.y==pos.y and wp.z==pos.z then
+                wp = goal
+            end
+        end
+
+        log("NAV", string.format("Leg %d -> wp(%d,%d,%d) remaining=%d", leg, wp.x, wp.y, wp.z, d))
+
+        local path = astar(pos, wp)
+        if path then
+            local ok = executePath(path, wp)
+            if not ok then
+                log("NAV", "Leg execution failed. Trying greedy step...")
+                if not greedyStep(goal) then
+                    alert(string.format("STUCK at (%d,%d,%d)", pos.x, pos.y, pos.z))
+                    return false
+                end
+            end
+        else
+            log("NAV", "A* failed for this leg. Trying greedy step...")
+            if not greedyStep(goal) then
+                alert(string.format("STUCK at (%d,%d,%d)", pos.x, pos.y, pos.z))
+                return false
+            end
+        end
+
+        sleep(0)
+    end
+
+    return true
+end
