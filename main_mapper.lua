@@ -32,9 +32,44 @@ local WANT_LIST = {                            -- ores worth a detour
     gold = true, redstone = true, lapis = true,
 }
 
-local DIRECTIONS   = { 0, 1, 2, 3 }   -- N, E, S, W assigned round-robin
-local HB_TIMEOUT   = 12000            -- ms before a miner is declared lost
-local DISP_REFRESH = 0.5              -- seconds between monitor redraws
+local DIRECTIONS   = { 0, 1, 2, 3 }    -- N, E, S, W assigned round-robin
+local LANE_SPACING = 4                   -- blocks between parallel tunnels
+local HB_TIMEOUT   = 12000
+local DISP_REFRESH = 0.5
+
+-- Zone tracking: zones[hwid] = { dir, lane_offset, exhausted }
+-- When a turtle reports DONE or PARKED after a full run,
+-- its zone is marked exhausted so it gets fresh coords next time.
+local zone_log      = {}     -- zone_log[hwid] = { dir, offset, exhausted }
+local lane_counters = {      -- how many lanes assigned per direction
+    [0]=0,[1]=0,[2]=0,[3]=0
+}
+
+local function assignLane(hwid)
+    -- Prefer a direction that has fewer turtles to spread the fleet out
+    local best_dir, best_count = 0, math.huge
+    for _,d in ipairs(DIRECTIONS) do
+        if lane_counters[d] < best_count then
+            best_count = lane_counters[d]
+            best_dir   = d
+        end
+    end
+    local offset = lane_counters[best_dir] * LANE_SPACING
+    lane_counters[best_dir] = lane_counters[best_dir] + 1
+    zone_log[hwid] = { dir=best_dir, offset=offset, exhausted=false }
+    return best_dir, offset
+end
+
+local function reassignLane(hwid)
+    -- Mark old zone exhausted, give a new lane on the same direction
+    local old = zone_log[hwid]
+    local dir = old and old.dir or 0
+    old.exhausted = true
+    local offset = lane_counters[dir] * LANE_SPACING
+    lane_counters[dir] = lane_counters[dir] + 1
+    zone_log[hwid] = { dir=dir, offset=offset, exhausted=false }
+    return dir, offset
+end
 
 -- Map display
 local MAP_RADIUS    = 24    -- max block radius drawn around the view centre
@@ -89,6 +124,57 @@ local total_voxels  = 0
 local view_cx, view_cz, view_y = 0, 0, 64   -- map centre, auto-tracked
 
 -- ============================================================
+-- PHASE 5A: MAP PERSISTENCE
+-- The voxel database survives overseer reboots. The map
+-- accumulates across multiple mining sessions automatically.
+-- Auto-saves every 60 seconds and on any clean shutdown.
+-- ============================================================
+local MAP_FILE      = "mnet_map.dat"
+local map_dirty     = false   -- true when unsaved changes exist
+local last_map_save = 0
+
+local function saveMap()
+    -- Flatten the 3D table into a list of {x,y,z,name} entries.
+    -- textutils.serialize handles nested tables fine but is slow on huge maps;
+    -- a flat list is both faster to write and to reload.
+    local entries = {}
+    for y, xt in pairs(master_voxels) do
+        for x, zt in pairs(xt) do
+            for z, name in pairs(zt) do
+                entries[#entries+1] = {x=x,y=y,z=z,n=name}
+            end
+        end
+    end
+    local f = fs.open(MAP_FILE, "w")
+    if f then
+        f.write(textutils.serialize(entries))
+        f.close()
+        map_dirty = false
+        last_map_save = os.epoch("utc")
+    end
+end
+
+local function loadMap()
+    if not fs.exists(MAP_FILE) then return end
+    local f = fs.open(MAP_FILE, "r")
+    if not f then return end
+    local data = textutils.unserialize(f.readAll() or "")
+    f.close()
+    if type(data) ~= "table" then return end
+    local count = 0
+    for _, e in ipairs(data) do
+        if type(e)=="table" and e.x and e.y and e.z and e.n then
+            if not master_voxels[e.y] then master_voxels[e.y]={} end
+            if not master_voxels[e.y][e.x] then master_voxels[e.y][e.x]={} end
+            master_voxels[e.y][e.x][e.z] = e.n
+            count = count + 1
+        end
+    end
+    total_voxels = count
+    print(string.format("[MAP]    Loaded %d voxels from disk.", count))
+end
+
+-- ============================================================
 -- PERIPHERALS
 -- ============================================================
 local modem = peripheral.find("modem")
@@ -140,6 +226,7 @@ local function setVoxel(x, y, z, name)
     if not master_voxels[y][x] then master_voxels[y][x] = {} end
     if not master_voxels[y][x][z] then total_voxels = total_voxels + 1 end
     master_voxels[y][x][z] = name
+    map_dirty = true
 end
 local function getVoxel(x, y, z)
     local ly = master_voxels[y]; if not ly then return nil end
@@ -594,12 +681,12 @@ local function renderMap(first_row, last_row, map_col_start, map_col_end)
     end
 end
 
--- ── PANEL: LEGEND + ALERT TICKER (bottom 2 rows) ──────────────────────
+-- ── PANEL: LEGEND + LIVE ORE FEED (bottom rows) ──────────────────────
 
 local function renderFooter(h, w)
     local BLK = c2b(colors.black)
 
-    -- Legend row
+    -- Legend row (second to last)
     local leg_t, leg_f, leg_b = {}, {}, {}
     local function legItem(ch, fg, label)
         local s = ch .. "=" .. label .. "  "
@@ -614,18 +701,23 @@ local function renderFooter(h, w)
     legItem("B", colors.cyan,    "Base")
     legItem("#", colors.yellow,  "Stone")
     legItem("d", colors.cyan,    "Ore")
-    -- pad to width
-    while #leg_t < w do leg_t[#leg_t+1]=" " leg_f[#leg_f+1]=BLK leg_b[#leg_b+1]=BLK end
-
+    while #leg_t < w do leg_t[#leg_t+1]=" "; leg_f[#leg_f+1]=BLK; leg_b[#leg_b+1]=BLK end
     mon.setCursorPos(1, h - 1)
-    mon.blit(table.concat(leg_t, "", 1, w),
-             table.concat(leg_f, "", 1, w),
-             table.concat(leg_b, "", 1, w))
+    mon.blit(table.concat(leg_t,"",1,w), table.concat(leg_f,"",1,w), table.concat(leg_b,"",1,w))
 
-    -- Alert ticker: cycle through recent alerts
-    local tick_idx = math.floor(os.epoch("utc") / 3000) % math.max(1, #alert_log) + 1
-    local alert_msg = alert_log[tick_idx] or "  All systems nominal."
-    solidRow(h, pad(" " .. alert_msg, w), colors.red, colors.black, w)
+    -- Bottom row: Phase 5C live ore feed (most recent find)
+    local feed_msg = "  No ore found yet."
+    if #ORE_FEED > 0 then
+        local latest = ORE_FEED[#ORE_FEED]
+        feed_msg = string.format(" %s %s %s (%d,%d,%d)",
+            latest.time, latest.hwid, latest.ore, latest.x, latest.y, latest.z)
+        -- Cycle through all feed entries every 3 seconds
+        local idx = math.floor(os.epoch("utc")/3000) % #ORE_FEED + 1
+        local e = ORE_FEED[idx]
+        feed_msg = string.format(" %s %s %s (%d,%d,%d)",
+            e.time, e.hwid, e.ore, e.x, e.y, e.z)
+    end
+    solidRow(h, pad(feed_msg, w), colors.cyan, colors.black, w)
 end
 
 -- ── Master render ──────────────────────────────────────────────────────
@@ -653,17 +745,37 @@ end
 local function handleAuth(net_id, msg)
     if type(msg.hwid) ~= "string" then return end
     local existing = fleet[msg.hwid]
-    local dir = existing and existing.dir or nextDirection()
+
+    local dir, offset
+    if existing and zone_log[msg.hwid] and not zone_log[msg.hwid].exhausted then
+        -- Re-enlisting turtle keeps its existing lane
+        dir    = zone_log[msg.hwid].dir
+        offset = zone_log[msg.hwid].offset
+    else
+        dir, offset = assignLane(msg.hwid)
+    end
+
     fleet[msg.hwid] = {
-        net_id = net_id, last_pulse = os.epoch("utc"),
-        pos = msg.pos or { x = 0, y = 0, z = 0 },
-        status = "STANDBY", dir = dir, fuel = "?", free = "?",
+        net_id      = net_id,
+        last_pulse  = os.epoch("utc"),
+        pos         = msg.pos or { x=0, y=0, z=0 },
+        status      = "STANDBY",
+        dir         = dir,
+        lane_offset = offset,
+        fuel        = "?",
+        free        = "?",
     }
+
     rednet.send(net_id, {
-        type = "AUTH_ACK", hwid = msg.hwid, direction = dir,
-        dump = DUMP_CHEST, base = BASE_CHEST,
+        type        = "AUTH_ACK",
+        hwid        = msg.hwid,
+        direction   = dir,
+        lane_offset = offset,
+        dump        = DUMP_CHEST,
+        base        = BASE_CHEST,
     }, PROTOCOL)
-    print(string.format("[ENLIST] %s  ->  direction %d", msg.hwid, dir))
+
+    print(string.format("[ENLIST] %s  ->  dir=%d lane=+%d", msg.hwid, dir, offset))
 end
 
 local function handleHeartbeat(msg)
@@ -673,20 +785,112 @@ local function handleHeartbeat(msg)
     if msg.fuel   then f.fuel   = msg.fuel   end
     if msg.pos    then f.pos    = msg.pos    end
     if msg.free   then f.free   = msg.free   end
+
+    -- When a turtle parks after exhausting its tunnel, mark zone done
+    if msg.status == "PARKED" and zone_log[msg.hwid] then
+        if not zone_log[msg.hwid].exhausted then
+            zone_log[msg.hwid].exhausted = true
+            print(string.format("[ZONE]   %s tunnel complete. Type 'newrun %s' to assign fresh lane.",
+                msg.hwid, msg.hwid))
+        end
+    end
+end
+
+-- ============================================================
+-- PHASE 5B: ORE CLUSTER DETECTION
+-- Groups nearby ore reports into clusters instead of dispatching
+-- one GOTO per individual block. When a new ore arrives, check
+-- if it is within CLUSTER_RADIUS of an existing cluster centre.
+-- If yes, merge it in (update centroid). If no, create a new cluster.
+-- Only dispatch when the cluster has not been dispatched yet.
+-- ============================================================
+local CLUSTER_RADIUS = 4   -- blocks; reports within this range merge
+local clusters       = {}  -- list of { ore, cx, cy, cz, count, dispatched }
+
+local function mergeOrCluster(ore_name, x, y, z)
+    -- Find an existing cluster of the same ore type within CLUSTER_RADIUS
+    for _, cl in ipairs(clusters) do
+        if cl.ore == ore_name then
+            local dist = math.abs(x-cl.cx)+math.abs(y-cl.cy)+math.abs(z-cl.cz)
+            if dist <= CLUSTER_RADIUS then
+                -- Update centroid (running average)
+                cl.count = cl.count + 1
+                cl.cx = math.floor((cl.cx*(cl.count-1) + x) / cl.count + 0.5)
+                cl.cy = math.floor((cl.cy*(cl.count-1) + y) / cl.count + 0.5)
+                cl.cz = math.floor((cl.cz*(cl.count-1) + z) / cl.count + 0.5)
+                return cl
+            end
+        end
+    end
+    -- New cluster
+    local cl = { ore=ore_name, cx=x, cy=y, cz=z, count=1, dispatched=false }
+    clusters[#clusters+1] = cl
+    return cl
+end
+
+-- Find the nearest idle turtle (MINING or STANDBY) to a coordinate
+local function nearestIdleTurtle(x, y, z, exclude_hwid)
+    local best_hwid, best_dist = nil, math.huge
+    for hwid, f in pairs(fleet) do
+        if hwid ~= exclude_hwid and f.pos then
+            local st = tostring(f.status):upper()
+            if st == "MINING" or st == "STANDBY" or st == "PARKED" then
+                local d = math.abs(f.pos.x-x)+math.abs(f.pos.y-y)+math.abs(f.pos.z-z)
+                if d < best_dist then best_dist=d; best_hwid=hwid end
+            end
+        end
+    end
+    return best_hwid
+end
+
+-- ============================================================
+-- PHASE 5C: LIVE ORE FEED
+-- Replaces the cycling alert ticker with a rolling feed of the
+-- last 8 ore finds: time, type, finder HWID, and coordinates.
+-- ============================================================
+local ORE_FEED      = {}   -- ring buffer of { time, ore, hwid, x, y, z }
+local ORE_FEED_MAX  = 8
+
+local function pushOreFeed(ore, hwid, x, y, z)
+    table.insert(ORE_FEED, {
+        time = os.date("%H:%M"),
+        ore  = ore,
+        hwid = hwid,
+        x=x, y=y, z=z,
+    })
+    if #ORE_FEED > ORE_FEED_MAX then table.remove(ORE_FEED, 1) end
 end
 
 local function handleOreReport(msg)
     if type(msg.ore) ~= "string" or type(msg.pos) ~= "table" then return end
-    ore_log[msg.ore] = (ore_log[msg.ore] or 0) + 1
-    if WANT_LIST[msg.ore] then
-        local k = msg.pos.x .. ":" .. msg.pos.y .. ":" .. msg.pos.z
-        if not dispatched[k] then
-            dispatched[k] = true
-            local f = fleet[msg.hwid]
-            if f then
-                rednet.send(f.net_id, { type = "GOTO", hwid = msg.hwid, ore = msg.ore, pos = msg.pos }, PROTOCOL)
-                print(string.format("[ORDER]  %s -> GOTO %s (%d,%d,%d)",
-                    msg.hwid, msg.ore, msg.pos.x, msg.pos.y, msg.pos.z))
+    local ore = msg.ore
+    local x, y, z = math.floor(msg.pos.x or 0), math.floor(msg.pos.y or 0), math.floor(msg.pos.z or 0)
+
+    -- Update running total
+    ore_log[ore] = (ore_log[ore] or 0) + 1
+
+    -- Push to live feed
+    pushOreFeed(ore, msg.hwid, x, y, z)
+
+    -- Phase 5B: cluster-aware dispatch
+    if WANT_LIST[ore] then
+        local cl = mergeOrCluster(ore, x, y, z)
+        if not cl.dispatched then
+            cl.dispatched = true
+            -- Dispatch the nearest idle turtle (not necessarily the reporter)
+            local target_hwid = nearestIdleTurtle(cl.cx, cl.cy, cl.cz, nil)
+            if target_hwid then
+                local f = fleet[target_hwid]
+                if f then
+                    rednet.send(f.net_id, {
+                        type = "GOTO",
+                        hwid = target_hwid,
+                        ore  = ore,
+                        pos  = { x=cl.cx, y=cl.cy, z=cl.cz },
+                    }, PROTOCOL)
+                    print(string.format("[ORDER]  %s -> GOTO %s cluster(%d,%d,%d) size=%d",
+                        target_hwid, ore, cl.cx, cl.cy, cl.cz, cl.count))
+                end
             end
         end
     end
@@ -740,6 +944,16 @@ local function prunerThread()
     end
 end
 
+local function mapSaveThread()
+    while true do
+        sleep(60)
+        if map_dirty then
+            saveMap()
+            print(string.format("[MAP]    Auto-saved %d voxels.", total_voxels))
+        end
+    end
+end
+
 local function displayThread()
     if not mon then return end
     while true do
@@ -766,7 +980,12 @@ local function printHelp()
     print("  setbase x y z           set emergency coal chest")
     print("  coords                  show chest coords")
     print("  want <ore> | unwant <ore> | wants")
-    print("  map                     show map stats")
+    print("  zones                   show tunnel zone assignments")
+    print("  newrun <hwid>           assign a fresh lane to a parked turtle")
+    print("  map                     map stats and file info")
+    print("  savemap                 force-save voxel map to disk now")
+    print("  clearmap                wipe the voxel map")
+    print("  feed                    show live ore feed (last 8 finds)")
     print("  help")
 end
 
@@ -815,10 +1034,57 @@ local function terminalThread()
             local any = false
             for ore in pairs(WANT_LIST) do write(ore .. " ") any = true end
             print(any and "" or "(nothing)")
+        elseif cmd == "zones" then
+            print("---- ZONES ----")
+            for hwid, z in pairs(zone_log) do
+                print(string.format("  %-10s dir=%d lane=+%d %s",
+                    hwid, z.dir, z.offset,
+                    z.exhausted and "[EXHAUSTED]" or "[ACTIVE]"))
+            end
+
+        elseif cmd == "newrun" then
+            local target = parts[2]
+            if target and fleet[target] then
+                local f = fleet[target]
+                local dir, offset = reassignLane(target)
+                f.dir         = dir
+                f.lane_offset = offset
+                rednet.send(f.net_id, {
+                    type        = "CONFIG",
+                    direction   = dir,
+                    lane_offset = offset,
+                    dump        = DUMP_CHEST,
+                    base        = BASE_CHEST,
+                }, PROTOCOL)
+                print(string.format("[CMD]    %s reassigned -> dir=%d lane=+%d", target, dir, offset))
+            elseif target then
+                print("Unknown turtle: "..target)
+            else
+                print("Usage: newrun <hwid>")
+            end
+            print(string.format("  Voxels stored : %d", total_voxels))
+            print(string.format("  View centre   : (%d,%d)  layer Y=%d", view_cx, view_cz, view_y))
         elseif cmd == "map" then
             print(string.format("  Voxels stored : %d", total_voxels))
             print(string.format("  View centre   : (%d,%d)  layer Y=%d", view_cx, view_cz, view_y))
-        elseif cmd == "help" then
+            print(string.format("  Map file      : %s", fs.exists(MAP_FILE) and MAP_FILE or "not saved yet"))
+        elseif cmd == "savemap" then
+            saveMap()
+            print(string.format("[MAP]    Saved %d voxels to disk.", total_voxels))
+        elseif cmd == "clearmap" then
+            master_voxels = {}; total_voxels = 0; map_dirty = false
+            if fs.exists(MAP_FILE) then fs.delete(MAP_FILE) end
+            print("[MAP]    Voxel database cleared.")
+        elseif cmd == "feed" then
+            if #ORE_FEED == 0 then print("  No ore found yet.")
+            else
+                print("---- ORE FEED ----")
+                for i = #ORE_FEED, 1, -1 do
+                    local e = ORE_FEED[i]
+                    print(string.format("  %s %-8s %-16s (%d,%d,%d)",
+                        e.time, e.hwid, e.ore, e.x, e.y, e.z))
+                end
+            end
             printHelp()
         elseif cmd and cmd ~= "" then
             print("Unknown command: " .. cmd .. "   (type help)")
@@ -830,18 +1096,20 @@ end
 -- ENTRY POINT
 -- ============================================================
 loadConfig()
+loadMap()   -- Phase 5A: restore voxel map from previous sessions
 
 print("+------------------------------------------+")
-print("|   M-NET V3  --  OVERSEER (FLEET COMMAND)  |")
+print("|   M-NET V3  --  OVERSEER  (Phase 1-5)    |")
 print("+------------------------------------------+")
 print("  Computer ID : " .. os.getComputerID())
 print("  Dump chest  : (" .. DUMP_CHEST.x .. ", " .. DUMP_CHEST.y .. ", " .. DUMP_CHEST.z .. ")")
 print("  Base chest  : (" .. BASE_CHEST.x .. ", " .. BASE_CHEST.y .. ", " .. BASE_CHEST.z .. ")")
 print("  Monitor     : " .. (mon and "linked" or "NONE (map disabled)"))
 print("  Warehouse   : " .. (vault and "linked" or "no chest found"))
+print("  Map voxels  : " .. total_voxels .. " (from disk)")
 print("")
 print("  Type  help  for the command list.")
 print("  Waiting for miners to enlist...")
 print("")
 
-parallel.waitForAll(listenerThread, prunerThread, displayThread, terminalThread)
+parallel.waitForAll(listenerThread, prunerThread, displayThread, terminalThread, mapSaveThread)
