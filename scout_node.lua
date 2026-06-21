@@ -508,16 +508,17 @@ local function executeDetour(path, goal)
 end
 
 -- ── GREEDY AXIS NAVIGATOR ────────────────────────────────
--- Move one step along the axis that reduces Manhattan distance
--- the most. Inspect first; dig if diggable; detour if protected.
+-- Tries each axis largest-first. Inspects before moving.
+-- Skips an axis if a protected block is in the way.
 -- Returns "moved", "stuck", or "arrived".
 local function greedyStep(goal)
     if pos.x==goal.x and pos.y==goal.y and pos.z==goal.z then return "arrived" end
 
-    -- Build a priority list: try the largest delta axis first.
     local dx = goal.x - pos.x
     local dy = goal.y - pos.y
     local dz = goal.z - pos.z
+
+    -- axes: { distance, facing_dir_or_nil, "h"/"u"/"d" }
     local axes = {
         { math.abs(dx), dx~=0 and (dx>0 and 1 or 3) or nil, "h" },
         { math.abs(dz), dz~=0 and (dz>0 and 2 or 0) or nil, "h" },
@@ -527,29 +528,27 @@ local function greedyStep(goal)
 
     for _, ax in ipairs(axes) do
         if ax[1] > 0 then
-            local ok = false
+            local skip = false
             if ax[3] == "u" then
-                ok = stepUp()
+                if stepUp() then return "moved" end
             elseif ax[3] == "d" then
-                ok = stepDown()
+                if stepDown() then return "moved" end
             else
                 face(ax[2])
-                -- Inspect before committing
                 local ok_i, dat_i = turtle.inspect()
-                if ok_i and type(dat_i)=="table" then
+                if ok_i and type(dat_i) == "table" then
                     local name = dat_i.name or ""
                     cacheSet(pos.x+DIRV[facing].dx, pos.y, pos.z+DIRV[facing].dz, name)
                     if not isPassable(name) and not isDiggable(name) then
-                        -- Protected block on best axis; skip to next axis
-                        log("NAV", "Protected ["..name.."] on best axis. Trying next axis.")
-                        goto continue
+                        log("NAV", "Protected ["..name.."] on axis. Trying next.")
+                        skip = true
                     end
                 end
-                ok = stepForward()
+                if not skip then
+                    if stepForward() then return "moved" end
+                end
             end
-            if ok then return "moved" end
         end
-        ::continue::
     end
     return "stuck"
 end
@@ -1190,13 +1189,31 @@ local function listenerThread()
 end
 
 local function heartbeatThread()
+    local scan_ticker = 0
     while true do
+        -- Heartbeat: always send current status to overseer
         pcall(rednet.send, server_id, {
-            type   = "HEARTBEAT", hwid = hwid,
+            type   = "HEARTBEAT",
+            hwid   = hwid,
             fuel   = turtle.getFuelLevel(),
-            pos    = copy(pos), free = freeSlots(),
+            pos    = copy(pos),
+            free   = freeSlots(),
             status = started and "MINING" or "STANDBY",
         }, PROTOCOL)
+
+        -- Passive scan: broadcast surrounding blocks to overseer map
+        -- even when standing by or navigating, not just when mining.
+        -- Only scan if pickaxe is on its side (scanner is available to swap).
+        scan_ticker = scan_ticker + 1
+        if scan_ticker >= 5 and has_scanner and not peripheral.wrap(pickaxeSide()) then
+            scan_ticker = 0
+            local snap = scanAround()
+            if #snap > 0 then
+                reportOres(snap)
+                sendSnapshot(snap)
+            end
+        end
+
         sleep(HEARTBEAT_INT)
     end
 end
