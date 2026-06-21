@@ -1,6 +1,10 @@
 --[[
-    M-NET V3 | OVERSEER  (Phase 1-5 + post-launch fixes)
+    O-NET V1 | OVERSEER
     =======================================================
+    Successor to M-NET V3. Coordinates the mining fleet,
+    maintains the voxel map, and brokers the O-NET V1
+    push protocol between turtles.
+
     Role : Fleet commander, warehouse monitor, and live map display.
 
     Hardware:
@@ -10,6 +14,7 @@
 
     Phase 4  Lane assignment: spreads turtles across parallel tunnels
              spaced LANE_SPACING (4) blocks apart. Tracks exhausted zones.
+             Re-enlisting turtles keep their existing lane if not exhausted.
              Commands: zones, newrun <hwid>
 
     Phase 5  Map persistence: voxel database saved to mnet_map.dat in
@@ -18,28 +23,42 @@
              stored. Stone is never stored (navigator assumes solid anyway).
              Auto-loaded at boot, auto-saved every 60 s.
              Ore cluster detection: nearby reports merge into one GOTO
-             dispatched to the nearest idle turtle.
+             dispatched to the nearest idle turtle. Cluster dispatched flag
+             resets on ORE_MINED so the same area can be re-dispatched.
              Live ore feed: bottom cockpit row cycles through last 8 finds.
+             oreColor() strips deepslate_/nether_ prefix for correct colour.
              Commands: savemap, clearmap, feed
 
-    Post-launch additions:
-        - setpark x1 y1 z1 x2 y2 z2: defines a parking rectangle.
-          Each turtle is assigned a unique slot; on PARKED it navigates
-          there and waits neatly instead of stopping wherever it finished.
-        - getme <ore> <count>: scans the map for known ore positions,
-          dispatches GOTOs to nearest idle turtles, tracks completion via
-          ORE_MINED messages and dump chest count. No-map warning prints
-          once only, not every 3 seconds.
-        - handleGeoData accepts air blocks, clearing dug tunnels on the
-          map in real time.
-        - shouldStore + setVoxel skip all stone-class blocks entirely,
-          keeping RAM and disk usage proportional to useful data only.
-        - Terminal thread fully fixed: all commands present and working,
-          no orphaned code blocks, help command wired correctly.
+    O-NET V1 additions:
+        - Push protocol broker: on PUSH_REQ from a stuck turtle, the
+          overseer identifies which turtle is at the blocked tile, compares
+          priorities via MOVE_PRIORITY_MAP, and sends a direct YIELD command
+          to the lower-urgency turtle. Mirrors Overmind's pushCreep() logic.
+        - MOVE_PRIORITY_MAP mirrors MOVE_PRIORITY in miner_node.lua.
+          GOTO=1 (never yields), ..., PARKED=9 (always yields).
+
+    Map behaviour:
+        - Air blocks clear voxels when received (tunnel tracking live).
+        - setVoxel and shouldStore skip all stone-class blocks entirely.
+        - total_voxels is decremented when air clears a stored voxel.
+        - cargoBar uses 14 slots (2-15; slot 1 reserved for scanner).
+
+    Parking:
+        - setpark x1 y1 z1 x2 y2 z2 defines a rectangle.
+        - getParkSlot(index) fills it row-by-row along the X axis.
+        - Each turtle gets a unique slot in AUTH_ACK and on setpark.
+        - broadcastConfig() does NOT send park (would corrupt turtle
+          park_pos — turtles expect {x,y,z}, not the zone definition).
+
+    getme command:
+        - Scans map for known ore positions, dispatches GOTOs to nearest
+          idle turtles, tracks completion via ORE_MINED + dump chest count.
+        - No-map warning prints once only (warned_empty flag per order).
+        - Completing orders auto-close when target count reached.
 
     Setup:
-        setdump x y z    loot drop chest
-        setbase x y z    emergency coal + pickaxe chest
+        setdump x y z                set loot drop chest
+        setbase x y z                set emergency coal + pickaxe chest
         setpark x1 y1 z1 x2 y2 z2   parking rectangle
         Type  help  for the full command list.
 ]]
@@ -47,7 +66,7 @@
 -- ============================================================
 -- CONFIGURATION
 -- ============================================================
-local PROTOCOL   = "MNET_V3"
+local PROTOCOL   = "ONET_V1"   -- upgraded from MNET_V3
 local DUMP_CHEST = { x = 0, y = 64, z = 0 }
 local BASE_CHEST = { x = 0, y = 64, z = 2 }
 
@@ -173,6 +192,21 @@ local dir_index  = 0
 local fleet_slot = 0    -- increments per turtle enlisted, used for park slot assignment
 local ore_log    = {}
 local dispatched = {}
+
+-- O-NET V1: priority map used by the push broker (Overmind: MovePriorities).
+-- Mirrors MOVE_PRIORITY table in miner_node.lua.
+-- Lower number = higher urgency = never gets YIELD'd by the broker.
+-- The broker sends YIELD to the turtle at the blocked tile only when
+-- that turtle's priority number is >= the pusher's priority number.
+local MOVE_PRIORITY_MAP = {
+    GOTO       = 1,   -- never yielded: targeted ore retrieval
+    RTB_FUEL   = 2,   -- nearly never yielded: emergency fuel
+    RTB_DUMP   = 3,   -- cargo run
+    FETCH_PICK = 4,   -- pickaxe fetch
+    MINING     = 5,   -- normal tunnelling
+    STANDBY    = 8,   -- idle
+    PARKED     = 9,   -- always yielded: lowest urgency
+}
 
 -- master_voxels[y][x][z] = blockName ; absolute world coords
 local master_voxels = {}
@@ -1122,6 +1156,40 @@ local function listenerThread()
                 local al = tostring(msg.hwid) .. ": " .. tostring(msg.msg)
                 print("[ALERT]  " .. al)
                 pushAlert(al)
+
+            -- O-NET V1: Push protocol broker.
+            -- A turtle broadcasts PUSH_REQ when stuck. We find who is at
+            -- the blocked position, compare priorities, and send a YIELD
+            -- directly to the lower-priority turtle if needed.
+            elseif msg.type == "PUSH_REQ" then
+                local want = msg.want
+                if want and type(want) == "table" then
+                    local pusher_pri = tonumber(msg.priority) or 10
+                    for target_hwid, f in pairs(fleet) do
+                        if target_hwid ~= msg.hwid and f.pos then
+                            local fp = f.pos
+                            if math.floor(fp.x)==want.x
+                            and math.floor(fp.y)==want.y
+                            and math.floor(fp.z)==want.z then
+                                -- Found the blocker. Check priority.
+                                local blocker_state = tostring(f.status or "STANDBY"):upper()
+                                local blocker_pri = MOVE_PRIORITY_MAP[blocker_state] or 10
+                                if blocker_pri >= pusher_pri then
+                                    rednet.send(f.net_id, {
+                                        type = "YIELD",
+                                        hwid = target_hwid,
+                                    }, PROTOCOL)
+                                    print(string.format(
+                                        "[PUSH]   %s(pri=%d) pushing %s(pri=%d) off (%d,%d,%d)",
+                                        msg.hwid, pusher_pri,
+                                        target_hwid, blocker_pri,
+                                        want.x, want.y, want.z))
+                                end
+                                break
+                            end
+                        end
+                    end
+                end
             end
         end
     end
@@ -1500,7 +1568,7 @@ loadConfig()
 loadMap()   -- Phase 5A: restore voxel map from previous sessions
 
 print("+------------------------------------------+")
-print("|   M-NET V3  --  OVERSEER  (Phase 1-5)    |")
+print("|   O-NET V1  --  OVERSEER  (Phase 1-5)    |")
 print("+------------------------------------------+")
 print("  Computer ID : " .. os.getComputerID())
 print("  Dump chest  : (" .. DUMP_CHEST.x .. ", " .. DUMP_CHEST.y .. ", " .. DUMP_CHEST.z .. ")")
