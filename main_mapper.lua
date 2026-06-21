@@ -12,23 +12,6 @@
         Advanced Monitor : any side or array (the live cockpit display)
         Supply chest     : adjacent optional (for the warehouse readout)
 
-    Phase 4  Lane assignment: spreads turtles across parallel tunnels
-             spaced LANE_SPACING (4) blocks apart. Tracks exhausted zones.
-             Re-enlisting turtles keep their existing lane if not exhausted.
-             Commands: zones, newrun <hwid>
-
-    Phase 5  Map persistence: voxel database saved to mnet_map.dat in
-             compact tab-separated format (x\ty\tz\tname per line).
-             Only ores, air corridors, hazards, and protected blocks are
-             stored. Stone is never stored (navigator assumes solid anyway).
-             Auto-loaded at boot, auto-saved every 60 s.
-             Ore cluster detection: nearby reports merge into one GOTO
-             dispatched to the nearest idle turtle. Cluster dispatched flag
-             resets on ORE_MINED so the same area can be re-dispatched.
-             Live ore feed: bottom cockpit row cycles through last 8 finds.
-             oreColor() strips deepslate_/nether_ prefix for correct colour.
-             Commands: savemap, clearmap, feed
-
     O-NET V1 additions:
         - Push protocol broker: on PUSH_REQ from a stuck turtle, the
           overseer identifies which turtle is at the blocked tile, compares

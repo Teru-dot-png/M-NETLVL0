@@ -14,42 +14,6 @@
         Other side: Diamond Pickaxe   (hot-swapped with scanner during scans)
         Slots 2-15: Coal or other fuel (self-sustaining after boot)
 
-    Phase 1  Hardened boot: detectHardware() scans all 16 slots + both
-             peripheral sides by exact item name before touching anything.
-             Calibration saved to mnet_cal.cfg; restored on reboot inside a
-             tunnel. Heading verified with a live GPS step on every restore
-             to catch push/rotation after save. All three threads restart
-             themselves via pcall loops on any internal crash.
-
-    Phase 2  State machine brain:
-             STANDBY -> MINING -> RTB_DUMP -> RTB_FUEL
-             -> FETCH_PICK -> GOTO -> PARKED
-             Every transition logged and broadcast to the overseer.
-             Move priority per state (O-NET V1): GOTO=1, RTB_FUEL=2,
-             RTB_DUMP=3, FETCH_PICK=4, MINING=5, STANDBY=8, PARKED=9.
-
-    Phase 3  Navigation (O-NET V1 rewrite):
-             Greedy axis navigator with A* detour on obstacle and spiral
-             recovery. navCost: air=1, unknown=4, stone=8 — navigator
-             strongly prefers dug tunnels.
-             Stuck detection: compares pos before/after each step (Overmind
-             STATE_PREV_X/Y pattern). Threshold = STUCK_VALUE (2 ticks).
-             Before spiralling: broadcasts PUSH_REQ so any turtle of lower
-             priority standing at the blocked tile steps aside.
-             GPS resync uses random probability (REPATH_PROB = 12.5%) per
-             step instead of fixed cadence — spreads fleet load across ticks.
-             Journeys >32 blocks split into waypoints for re-evaluation.
-             Climb-over: if all 6 dirs fail, steps up and tries horizontal
-             (handles create:item_vault and other 1-tall protected blocks).
-
-    Phase 4  Tunnel strategy: overseer assigns perpendicular lane offsets
-             so multiple turtles mine parallel corridors 4 blocks apart.
-             Cuts 1-wide 2-tall tunnel so return path always has headroom.
-
-    Phase 5  Intelligence: passive geo-scan every 5 heartbeats feeds the
-             overseer map even during standby. Every forward() move sends a
-             single-block GEO_DATA air update so the map shows tunnels
-             carving out in real time.
 
     Inventory rules:
              Slot 1 is permanently reserved for the geo scanner.
@@ -62,9 +26,9 @@
         2. openModem()         open rednet on detected modem side
         3. wakeUp()            burn aboard fuel; wait if empty
         4. calibrate()         restore from disk or GPS-derive heading
-        5. forageForCoal()     mine coal if still below FUEL_TARGET
-        6. handshake()         enlist; receive base+dump+lane+park from overseer
-        7. bootEquipPickaxe()  equip pickaxe; fetch from BASE_CHEST if missing
+        5. handshake()         enlist; receive base+dump+lane+park from overseer
+        6. bootEquipPickaxe()  equip pickaxe; fetch from BASE_CHEST if missing
+        7. forageForCoal()     mine coal if still below FUEL_TARGET
         8. parallel.waitForAll(brain, listener, heartbeat)
 
     REQUIRES: working GPS constellation in this dimension.
@@ -813,6 +777,7 @@ function moveTo(goal)
     end
 
     local MAX_DETOURS = 6
+    nav_prev_pos = copy(pos)
 
     for wp_i, wp in ipairs(waypoints) do
         if #waypoints > 1 then
@@ -823,30 +788,38 @@ function moveTo(goal)
         local detours = 0
 
         while pos.x~=wp.x or pos.y~=wp.y or pos.z~=wp.z do
-            if home_requested then nav_stuck_cnt=0; return false end
+            if home_requested then
+                nav_stuck_cnt = 0
+                nav_prev_pos = nil
+                return false
+            end
 
             -- O-NET V1: snapshot position BEFORE the move attempt
-            local before_x, before_y, before_z = pos.x, pos.y, pos.z
+            local before = nav_prev_pos or copy(pos)
 
             liveInspect()
             local result = greedyStep(wp)
 
             if result == "arrived" then
                 nav_stuck_cnt = 0
+                nav_prev_pos = copy(pos)
                 break
             end
 
             -- O-NET V1: compare position. If it changed → not stuck, reset counter.
             -- If unchanged → increment. This catches phantom "moved" returns where
             -- another turtle immediately pushed us back.
-            if pos.x ~= before_x or pos.y ~= before_y or pos.z ~= before_z then
+            local after = copy(pos)
+            if after.x ~= before.x or after.y ~= before.y or after.z ~= before.z then
                 nav_stuck_cnt = 0
+                nav_prev_pos = after
                 -- O-NET V1: random repath probability instead of fixed cadence.
                 -- Expected frequency same as % 8 but spread across the fleet.
                 if math.random() < 0.15 then gpsSyncPos() end
                 sleep(0)
             else
                 nav_stuck_cnt = nav_stuck_cnt + 1
+                nav_prev_pos = after
                 log("NAV",string.format("[O-NET] Stuck %d/%d at (%d,%d,%d) -> (%d,%d,%d)",
                     nav_stuck_cnt, STUCK_VALUE,
                     pos.x,pos.y,pos.z, wp.x,wp.y,wp.z))
@@ -900,6 +873,7 @@ function moveTo(goal)
                                     pos  = copy(pos),
                                 }, PROTOCOL)
                                 nav_stuck_cnt = 0
+                                nav_prev_pos = nil
                                 return false
                             end
                             sleep(2)
@@ -915,6 +889,7 @@ function moveTo(goal)
     local arrived = pos.x==goal.x and pos.y==goal.y and pos.z==goal.z
     if arrived then
         nav_stuck_cnt = 0
+        nav_prev_pos = nil
         log("NAV",string.format("Arrived at (%d,%d,%d).", goal.x,goal.y,goal.z))
     end
     return arrived
@@ -1413,7 +1388,7 @@ local park_pos        = nil   -- assigned parking slot, nil = park in place
 -- thrash loops. Now the counter accumulates across crashes.
 -- Mirrors Overmind's STATE_PREV_X/Y and STATE_STUCK in creep memory.
 local nav_stuck_cnt  = 0      -- ticks with unchanged position (Overmind: STATE_STUCK)
-local nav_prev_pos   = nil    -- position snapshot last nav tick (unused directly; pos comparison is inline)
+local nav_prev_pos   = nil    -- position snapshot from previous nav tick (for persistence / serialization)
 local block_movement = false  -- set by YIELD handler; cleared after one move attempt
 
 local function setState(new_state)
@@ -1875,7 +1850,7 @@ end
 -- ── Phase 1+2: pcall restart wrappers ───────────────────
 local function listenerThread_inner()
     while true do
-        local _,msg = rednet.receive(PROTOCOL)
+        local sender,msg = rednet.receive(PROTOCOL)
         if type(msg) == "table" then
             if     msg.type=="CMD_START"  then started=true;        log("CMD","Start received.")
             elseif msg.type=="CMD_STOP"   then started=false;       log("CMD","Stop received.")
@@ -1951,6 +1926,17 @@ local function listenerThread_inner()
                 end
                 block_movement = true
                 log("PUSH","YIELD "..( yielded and "done" or "failed")..".")
+
+                -- Confirm YIELD handling so broker logic can resolve without timeout.
+                if sender then
+                    pcall(rednet.send, sender, {
+                        type  = "YIELD_ACK",
+                        hwid  = hwid,
+                        ok    = yielded,
+                        pos   = copy(pos),
+                        state = current_state,
+                    }, PROTOCOL)
+                end
             end
         end
     end
@@ -2000,9 +1986,9 @@ detectHardware()   -- 1. find everything, touch nothing
 openModem()        -- 2. open rednet on detected modem
 wakeUp()           -- 3. burn aboard fuel, wait if empty
 calibrate()        -- 4. restore from disk or GPS-derive heading
-forageForCoal()    -- 5. mine coal if still below target
-handshake()        -- 6. enlist, get base+dump coords
-bootEquipPickaxe() -- 7. equip pickaxe now that we can navigate
+handshake()        -- 5. enlist, get base+dump coords
+bootEquipPickaxe() -- 6. equip pickaxe now that we can navigate
+forageForCoal()    -- 7. mine coal if still below target
 
 log("BOOT",string.format(
     "Ready. Pickaxe=%s Scanner=%s (slot %s) Fuel=%s Pos=(%d,%d,%d) Facing=%s",
