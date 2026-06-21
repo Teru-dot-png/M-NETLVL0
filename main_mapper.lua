@@ -307,11 +307,13 @@ end
 
 local function statusColor(status)
     status = tostring(status or ""):upper()
-    if status == "MINING"  then return colors.lime end
-    if status == "STANDBY" then return colors.yellow end
-    if status == "GOTO"    then return colors.cyan end
-    if status == "DUMP"    then return colors.orange end
-    if status == "RECALL"  then return colors.magenta end
+    if status == "MINING"     then return colors.lime      end
+    if status == "STANDBY"    then return colors.yellow    end
+    if status == "PARKED"     then return colors.gray      end
+    if status == "GOTO"       then return colors.cyan      end
+    if status == "RTB_DUMP"   then return colors.orange    end
+    if status == "RTB_FUEL"   then return colors.red       end
+    if status == "FETCH_PICK" then return colors.magenta   end
     return colors.lightGray
 end
 
@@ -350,7 +352,8 @@ local function renderHeader(w)
 
     -- Row 2: fleet stats + map info
     local mining = 0
-    for _, f in pairs(fleet) do if tostring(f.status):upper() == "MINING" then mining = mining + 1 end end
+    local ACTIVE_STATES = { MINING=true, GOTO=true, RTB_DUMP=true, RTB_FUEL=true, FETCH_PICK=true }
+    for _, f in pairs(fleet) do if ACTIVE_STATES[tostring(f.status):upper()] then mining=mining+1 end end
     local ore_total = 0
     for _, v in pairs(ore_log) do ore_total = ore_total + v end
 
