@@ -1503,26 +1503,102 @@ local function state_FETCH_PICK()
 end
 
 -- ── GOTO ─────────────────────────────────────────────────
+-- Travels to the ore cluster centroid, then does a vein sweep:
+-- inspects all 6 faces and digs any block whose name matches
+-- the requested ore, repeating until no more adjacent matches.
+-- Reports each mined block to the overseer individually.
+-- Then returns to resume position and continues mining.
 local function state_GOTO()
     if not goto_job then return "MINING" end
     local job = goto_job
     goto_job  = nil
 
     local resume = copy(pos)
-    log("GOTO", string.format("Fetching %s at (%d,%d,%d)",
-        job.ore or "ore", job.pos.x, job.pos.y, job.pos.z))
+    local ore_name = job.ore or "ore"
+    log("GOTO", string.format("Heading to %s cluster (%d,%d,%d)",
+        ore_name, job.pos.x, job.pos.y, job.pos.z))
 
     if not pickaxeEquipped() then
         log("GOTO","No pickaxe. Skipping job.")
         return "FETCH_PICK"
     end
 
-    if moveTo(job.pos) then
-        pcall(rednet.send, server_id,
-            {type="ORE_MINED", hwid=hwid, ore=job.ore, pos=job.pos}, PROTOCOL)
-        log("GOTO","Mined "..(job.ore or "ore")..".")
+    if not moveTo(job.pos) then
+        log("GOTO","Could not reach cluster. Skipping.")
+        moveTo(resume); face(my_dir)
+        return started and "MINING" or "STANDBY"
+    end
+
+    -- Vein sweep: check all 6 faces repeatedly until no more ore found.
+    -- Limit passes to avoid infinite loops in huge veins.
+    local mined_total = 0
+    local MAX_VEIN    = 32   -- max blocks to mine in one GOTO job
+    local changed     = true
+
+    while changed and mined_total < MAX_VEIN do
+        changed = false
+
+        -- Check front (all 4 horizontal faces by rotating)
+        for _ = 1, 4 do
+            local ok, data = turtle.inspect()
+            if ok and type(data) == "table" then
+                local n = data.name or ""
+                if n:find(ore_name, 1, true) then
+                    if turtle.dig() then
+                        cacheSet(pos.x+DIRV[facing].dx, pos.y, pos.z+DIRV[facing].dz, "air")
+                        pcall(rednet.send, server_id, {
+                            type="GEO_DATA", hwid=hwid, pos=copy(pos),
+                            scan_data={{x=DIRV[facing].dx, y=0, z=DIRV[facing].dz, name="minecraft:air"}},
+                        }, PROTOCOL)
+                        pcall(rednet.send, server_id,
+                            {type="ORE_MINED", hwid=hwid, ore=ore_name,
+                             pos={x=pos.x+DIRV[facing].dx, y=pos.y, z=pos.z+DIRV[facing].dz}},
+                            PROTOCOL)
+                        mined_total = mined_total + 1
+                        changed = true
+                    end
+                end
+            end
+            turnRight()
+        end
+
+        -- Check above
+        local ok_u, dat_u = turtle.inspectUp()
+        if ok_u and type(dat_u)=="table" then
+            local n = dat_u.name or ""
+            if n:find(ore_name, 1, true) then
+                if turtle.digUp() then
+                    cacheSet(pos.x, pos.y+1, pos.z, "air")
+                    pcall(rednet.send, server_id,
+                        {type="ORE_MINED", hwid=hwid, ore=ore_name,
+                         pos={x=pos.x, y=pos.y+1, z=pos.z}}, PROTOCOL)
+                    mined_total = mined_total + 1
+                    changed = true
+                end
+            end
+        end
+
+        -- Check below
+        local ok_d, dat_d = turtle.inspectDown()
+        if ok_d and type(dat_d)=="table" then
+            local n = dat_d.name or ""
+            if n:find(ore_name, 1, true) then
+                if turtle.digDown() then
+                    cacheSet(pos.x, pos.y-1, pos.z, "air")
+                    pcall(rednet.send, server_id,
+                        {type="ORE_MINED", hwid=hwid, ore=ore_name,
+                         pos={x=pos.x, y=pos.y-1, z=pos.z}}, PROTOCOL)
+                    mined_total = mined_total + 1
+                    changed = true
+                end
+            end
+        end
+    end
+
+    if mined_total > 0 then
+        log("GOTO", string.format("Vein complete: %d %s mined.", mined_total, ore_name))
     else
-        log("GOTO","Could not reach ore. Skipping.")
+        log("GOTO", "No matching ore found at cluster location (already mined or wrong coords).")
     end
 
     moveTo(resume)
