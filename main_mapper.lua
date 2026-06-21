@@ -108,10 +108,9 @@ local function assignLane(hwid)
 end
 
 local function reassignLane(hwid)
-    -- Mark old zone exhausted, give a new lane on the same direction
     local old = zone_log[hwid]
+    if old then old.exhausted = true end
     local dir = old and old.dir or 0
-    old.exhausted = true
     local offset = lane_counters[dir] * LANE_SPACING
     lane_counters[dir] = lane_counters[dir] + 1
     zone_log[hwid] = { dir=dir, offset=offset, exhausted=false }
@@ -156,9 +155,12 @@ local function loadConfig()
 end
 
 local function broadcastConfig()
+    -- Note: park is NOT broadcast here because each turtle has a different
+    -- slot position. Park slots are sent individually via AUTH_ACK and
+    -- the setpark command loop. Sending PARK_ZONE here would corrupt
+    -- turtle park_pos (they expect {x,y,z} not {x1,y1,z1,x2,y2,z2}).
     rednet.broadcast({
-        type = "CONFIG", dump = DUMP_CHEST,
-        base = BASE_CHEST, park = PARK_ZONE,
+        type = "CONFIG", dump = DUMP_CHEST, base = BASE_CHEST,
     }, PROTOCOL)
 end
 
@@ -477,9 +479,10 @@ local function fuelBar(fuel, maxFuel)
 end
 
 local function cargoBar(freeSlots)
-    freeSlots = tonumber(freeSlots) or 15
-    local used = 15 - math.max(0, math.min(15, freeSlots))
-    local filled = math.floor(used / 15 * 5 + 0.5)
+    -- Slots 2-15 = 14 cargo slots (slot 1 reserved for scanner)
+    freeSlots = tonumber(freeSlots) or 14
+    local used = 14 - math.max(0, math.min(14, freeSlots))
+    local filled = math.floor(used / 14 * 5 + 0.5)
     return "[" .. string.rep("#", filled) .. string.rep(".", 5 - filled) .. "]"
 end
 
@@ -519,7 +522,13 @@ local ORE_COLOUR = {
     ancient_debris= colors.purple,
 }
 local function oreColor(name)
-    return ORE_COLOUR[name] or colors.white
+    -- name arrives as short form e.g. "deepslate_diamond" or "diamond_ore"
+    -- strip any _ore suffix and deepslate_/nether_ prefix to get base ore
+    local base = name:match("deepslate_(.-)_ore$")
+              or name:match("nether_(.-)_ore$")
+              or name:match("(.-)_ore$")
+              or name
+    return ORE_COLOUR[base] or colors.white
 end
 
 -- ── PANEL: HEADER (rows 1-3) ───────────────────────────────────────────
@@ -1055,8 +1064,10 @@ local function handleGeoData(msg)
                 local az = floor(oz + (b.z or 0))
                 if isAir(b.name) then
                     -- Clear this voxel: tunnel was dug here
-                    if master_voxels[ay] and master_voxels[ay][ax] then
+                    if master_voxels[ay] and master_voxels[ay][ax]
+                    and master_voxels[ay][ax][az] ~= nil then
                         master_voxels[ay][ax][az] = nil
+                        total_voxels = math.max(0, total_voxels - 1)
                     end
                     map_dirty = true
                 else
@@ -1079,10 +1090,9 @@ local function listenerThread()
             elseif msg.type == "ORE_REPORT" then handleOreReport(msg)
             elseif msg.type == "GEO_DATA"   then handleGeoData(msg)
             elseif msg.type == "ORE_MINED"  then
-                -- A turtle confirmed it mined an ore block.
-                -- Update any active order that matches.
                 local ore = tostring(msg.ore or "")
                 local k   = (msg.pos and (msg.pos.x..":"..msg.pos.y..":"..msg.pos.z)) or ""
+                -- Update active orders
                 for order_ore, order in pairs(active_orders) do
                     if ore:find(order_ore, 1, true) or order_ore:find(ore, 1, true) then
                         if order.jobs[k] then
@@ -1090,6 +1100,21 @@ local function listenerThread()
                             order.got = order.got + 1
                             print(string.format("[ORDER]  getme %s: %d/%d confirmed.",
                                 order_ore, order.got, order.target))
+                        end
+                    end
+                end
+                -- Reset cluster dispatched flag near this position so the
+                -- same area can be re-dispatched if more ore appears later
+                if msg.pos then
+                    local px = math.floor(msg.pos.x or 0)
+                    local py = math.floor(msg.pos.y or 0)
+                    local pz = math.floor(msg.pos.z or 0)
+                    for _, cl in ipairs(clusters) do
+                        if cl.ore == ore then
+                            local d = math.abs(px-cl.cx)+math.abs(py-cl.cy)+math.abs(pz-cl.cz)
+                            if d <= CLUSTER_RADIUS then
+                                cl.dispatched = false
+                            end
                         end
                     end
                 end
