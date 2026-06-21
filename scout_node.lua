@@ -2255,6 +2255,36 @@ local function listenerThread_inner()
                 log("CMD","Start received.")
             elseif msg.type=="CMD_STOP"   then started=false;       log("CMD","Stop received.")
             elseif msg.type=="CMD_RECALL" then home_requested=true; log("CMD","Recall received.")
+            elseif msg.type=="TUNNEL_FROM" and msg.hwid==hwid then
+                if type(msg.pos)=="table" and tonumber(msg.dir) then
+                    local t = {
+                        x = math.floor(tonumber(msg.pos.x) or pos.x),
+                        y = math.floor(tonumber(msg.pos.y) or pos.y),
+                        z = math.floor(tonumber(msg.pos.z) or pos.z),
+                    }
+                    local d = math.floor(tonumber(msg.dir) or my_dir) % 4
+                    started = false
+                    home_requested = false
+                    jobs = {}
+                    goto_job = nil
+                    log("CMD", string.format("TUNNEL_FROM to (%d,%d,%d) dir=%d", t.x, t.y, t.z, d))
+                    local moved = moveTo(t)
+                    if moved then
+                        my_dir = d
+                        face(my_dir)
+                        lane_offset = 0
+                        lane_positioned = true
+                        tunnelled = 0
+                        reported = {}
+                        started = true
+                        pcall(rednet.send, server_id, { type="PARK_RELEASE", hwid=hwid }, PROTOCOL)
+                        log("CMD", "TUNNEL_FROM armed. Mining started.")
+                    else
+                        log("CMD", "TUNNEL_FROM failed to reach target position.")
+                    end
+                else
+                    log("CMD", "TUNNEL_FROM invalid payload.")
+                end
             elseif msg.type=="CONFIG" then
                 if msg.dump then dump=msg.dump; cacheSet(dump.x,dump.y,dump.z,"minecraft:chest") end
                 if msg.base then base=msg.base; cacheSet(base.x,base.y,base.z,"minecraft:chest") end

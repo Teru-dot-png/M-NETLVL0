@@ -1117,6 +1117,49 @@ local function handleParkRelease(msg)
     clearParkClaim(msg.hwid)
 end
 
+local function fleetSnapshot()
+    local out = {}
+    for hwid, f in pairs(fleet) do
+        local p = f.pos or { x = 0, y = 0, z = 0 }
+        local st = tostring(f.status or "?"):upper()
+        out[#out+1] = {
+            hwid = hwid,
+            status = st,
+            fuel = f.fuel,
+            free = f.free,
+            pos = { x = p.x or 0, y = p.y or 0, z = p.z or 0 },
+            available = (st == "STANDBY" or st == "PARKED" or st == "MINING"),
+        }
+    end
+    table.sort(out, function(a, b) return tostring(a.hwid) < tostring(b.hwid) end)
+    return out
+end
+
+local function sendGotoToBot(hwid, target_pos, ore_tag)
+    local f = fleet[hwid]
+    if not f or not f.net_id or type(target_pos) ~= "table" then return false end
+    rednet.send(f.net_id, {
+        type = "GOTO",
+        hwid = hwid,
+        ore  = tostring(ore_tag or "tablet"),
+        pos  = {
+            x = math.floor(tonumber(target_pos.x) or 0),
+            y = math.floor(tonumber(target_pos.y) or 0),
+            z = math.floor(tonumber(target_pos.z) or 0),
+        },
+    }, PROTOCOL)
+    return true
+end
+
+local function parseDirToken(tok)
+    local t = tostring(tok or ""):lower()
+    if t == "0" or t == "n" or t == "north" then return 0 end
+    if t == "1" or t == "e" or t == "east"  then return 1 end
+    if t == "2" or t == "s" or t == "south" then return 2 end
+    if t == "3" or t == "w" or t == "west"  then return 3 end
+    return nil
+end
+
 -- ============================================================
 -- ACTIVE ORDERS  (getme command)
 -- active_orders[ore_name] = {
@@ -1126,6 +1169,132 @@ end
 -- }
 -- ============================================================
 local active_orders = {}
+
+local function startGetmeOrder(ore_name, target)
+    ore_name = tostring(ore_name or "")
+    target   = tonumber(target)
+    if ore_name == "" or not target or target <= 0 then
+        return false, "Usage: getme <ore> <count>"
+    end
+
+    if active_orders[ore_name] then
+        print(string.format("[ORDER]  Replacing existing getme %s order.", ore_name))
+    end
+    active_orders[ore_name] = {
+        target = target,
+        got    = 0,
+        jobs   = {},
+    }
+
+    local in_chest = countInDump(ore_name)
+    local on_map   = #findOreInMap(ore_name, nil)
+    print(string.format(
+        "[ORDER]  getme %s x%d started. In chest: %d. Known on map: %d locations.",
+        ore_name, target, in_chest, on_map))
+    if in_chest >= target then
+        print(string.format("[ORDER]  Already have %d in dump chest. Order complete.", in_chest))
+        active_orders[ore_name] = nil
+    elseif on_map == 0 then
+        print("[ORDER]  No known locations on map yet. Fleet will report finds as it mines.")
+    end
+
+    return true
+end
+
+local function handleTabletSyncReq(net_id, msg)
+    rednet.send(net_id, {
+        type = "TABLET_SYNC",
+        from = "overseer",
+        tablet = msg and msg.tablet,
+        dump = DUMP_CHEST,
+        base = BASE_CHEST,
+        park = PARK_ZONE,
+        fleet = fleetSnapshot(),
+        wants = WANT_LIST,
+        t = os.epoch("utc"),
+    }, PROTOCOL)
+end
+
+local function handleTabletCmd(net_id, msg)
+    local action = tostring(msg.action or ""):upper()
+    if action == "START" then
+        rednet.broadcast({ type = "CMD_START" }, PROTOCOL)
+        clearAllParkClaims()
+        rednet.send(net_id, { type = "TABLET_ACK", ok = true, action = action }, PROTOCOL)
+        print("[TAB]    START command broadcast.")
+        return
+    elseif action == "STOP" then
+        rednet.broadcast({ type = "CMD_STOP" }, PROTOCOL)
+        rednet.send(net_id, { type = "TABLET_ACK", ok = true, action = action }, PROTOCOL)
+        print("[TAB]    STOP command broadcast.")
+        return
+    elseif action == "RECALL" then
+        rednet.broadcast({ type = "CMD_RECALL" }, PROTOCOL)
+        rednet.send(net_id, { type = "TABLET_ACK", ok = true, action = action }, PROTOCOL)
+        print("[TAB]    RECALL command broadcast.")
+        return
+    end
+
+    if action == "GETME" then
+        local ok, err = startGetmeOrder(msg.ore, msg.count)
+        rednet.send(net_id, { type = "TABLET_ACK", ok = ok, action = action, err = err }, PROTOCOL)
+        return
+    end
+
+    local hwid = tostring(msg.hwid or "")
+    local f = fleet[hwid]
+    if hwid == "" or not f then
+        rednet.send(net_id, {
+            type = "TABLET_ACK", ok = false, action = action,
+            err = "Unknown bot: " .. hwid,
+        }, PROTOCOL)
+        return
+    end
+
+    if action == "COME_TO_ME" or action == "GOTO" then
+        local ok = sendGotoToBot(hwid, msg.pos, action == "COME_TO_ME" and "tablet_call" or "tablet_goto")
+        rednet.send(net_id, {
+            type = "TABLET_ACK", ok = ok, action = action,
+            hwid = hwid, err = ok and nil or "Missing target position",
+        }, PROTOCOL)
+        if ok then
+            local p = msg.pos
+            print(string.format("[TAB]    %s -> %s (%d,%d,%d)", action, hwid, p.x, p.y, p.z))
+        end
+        return
+    end
+
+    if action == "TUNNEL_FROM" then
+        local dir = parseDirToken(msg.dir)
+        local p = msg.pos
+        if dir == nil or type(p) ~= "table" then
+            rednet.send(net_id, {
+                type = "TABLET_ACK", ok = false, action = action,
+                hwid = hwid, err = "Need pos{x,y,z} and dir(n/e/s/w or 0..3)",
+            }, PROTOCOL)
+            return
+        end
+        rednet.send(f.net_id, {
+            type = "TUNNEL_FROM",
+            hwid = hwid,
+            pos = {
+                x = math.floor(tonumber(p.x) or 0),
+                y = math.floor(tonumber(p.y) or 0),
+                z = math.floor(tonumber(p.z) or 0),
+            },
+            dir = dir,
+        }, PROTOCOL)
+        rednet.send(net_id, { type = "TABLET_ACK", ok = true, action = action, hwid = hwid }, PROTOCOL)
+        print(string.format("[TAB]    TUNNEL_FROM -> %s at (%d,%d,%d) dir=%d",
+            hwid, p.x, p.y, p.z, dir))
+        return
+    end
+
+    rednet.send(net_id, {
+        type = "TABLET_ACK", ok = false, action = action,
+        err = "Unsupported action",
+    }, PROTOCOL)
+end
 
 -- Tile reservations for collision prevention.
 -- reservations["x:y:z"] = { hwid = "MN-0001", expires = epoch_ms }
@@ -1461,6 +1630,12 @@ local function listenerThread()
             elseif msg.type == "PARK_RELEASE" then
                 handleParkRelease(msg)
 
+            elseif msg.type == "TABLET_SYNC_REQ" then
+                handleTabletSyncReq(net_id, msg)
+
+            elseif msg.type == "TABLET_CMD" then
+                handleTabletCmd(net_id, msg)
+
             elseif msg.type == "RESERVE_REQ" then
                 handleReserveReq(net_id, msg)
 
@@ -1767,35 +1942,10 @@ local function terminalThread()
             end
 
         elseif cmd == "getme" then
-            -- Usage: getme <ore> <count>
-            -- Scans the map for known ore locations, dispatches GOTOs to
-            -- the nearest idle turtles, and keeps dispatching until the
-            -- target count arrives in the dump chest.
-            local ore_name = parts[2]
-            local target   = tonumber(parts[3])
-            if not ore_name or not target or target <= 0 then
+            local ok, err = startGetmeOrder(parts[2], parts[3])
+            if not ok then
+                print(err)
                 print("Usage: getme <ore> <count>   e.g. getme diamond 128")
-            else
-                -- Cancel any previous order for this ore
-                if active_orders[ore_name] then
-                    print(string.format("[ORDER]  Replacing existing getme %s order.", ore_name))
-                end
-                active_orders[ore_name] = {
-                    target = target,
-                    got    = 0,
-                    jobs   = {},
-                }
-                local in_chest = countInDump(ore_name)
-                local on_map   = #findOreInMap(ore_name, nil)
-                print(string.format(
-                    "[ORDER]  getme %s x%d started. In chest: %d. Known on map: %d locations.",
-                    ore_name, target, in_chest, on_map))
-                if in_chest >= target then
-                    print(string.format("[ORDER]  Already have %d in dump chest. Order complete.", in_chest))
-                    active_orders[ore_name] = nil
-                elseif on_map == 0 then
-                    print("[ORDER]  No known locations on map yet. Fleet will report finds as it mines.")
-                end
             end
 
         elseif cmd == "orders" then
