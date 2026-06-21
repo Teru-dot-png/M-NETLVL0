@@ -1,23 +1,30 @@
 --[[
-    M-NET V3 | OVERSEER  (fleet commander + warehouse + live map)
-    =============================================================
-    Role : Hands out tunnel directions, tracks the fleet, fetches wanted
-           ores, sweeps an adjacent supply chest, and renders a live monitor
-           with an online-robot roster and a top-down scanned voxel map.
+    M-NET V3 | OVERSEER  (Phase 1-5)
+    ==================================
+    Role : Fleet commander, warehouse monitor, and live map display.
 
-    HARDWARE:
-        Ender Modem      : any side (comms with the fleet)
-        Advanced Monitor : any side or array (the live display)
-        Supply chest     : adjacent (optional, for the supply readout)
+    Hardware:
+        Ender Modem      : any side (found via peripheral.find)
+        Advanced Monitor : any side or array (the live cockpit display)
+        Supply chest     : adjacent optional (for the warehouse readout)
 
-    SCREENS:
-        The MONITOR shows the roster + map and refreshes on its own.
-        The COMPUTER terminal is where you type commands and read the log.
+    Phase 4  Lane assignment: spreads turtles across parallel tunnels
+             spaced LANE_SPACING blocks apart. Tracks exhausted zones.
+             Commands: zones, newrun <hwid>
 
-    SETUP:
-        Type  setdump x y z  and  setbase x y z  to point the turtles at your
-        chests (look at each, press F3, read "Targeted Block"). These save to
-        disk and push live to the fleet. Type  help  for everything else.
+    Phase 5  Map persistence: voxel database saved to mnet_map.dat,
+             auto-loaded at boot and auto-saved every 60 seconds.
+             Ore cluster detection: nearby reports merge into one GOTO
+             dispatched to the nearest idle turtle.
+             Live ore feed: bottom cockpit row cycles through last 8 finds.
+             Commands: savemap, clearmap, feed
+
+    Setup:
+        Type  setdump x y z  to set the loot drop chest.
+        Type  setbase x y z  to set the emergency coal + pickaxe chest.
+        (Look at each chest, press F3, read "Targeted Block".)
+        Coords save to disk and push live to the fleet.
+        Type  help  for the full command list.
 ]]
 
 -- ============================================================
@@ -121,7 +128,15 @@ local dispatched = {}
 local master_voxels = {}
 local total_voxels  = 0
 
-local view_cx, view_cz, view_y = 0, 0, 64   -- map centre, auto-tracked
+local view_cx, view_cz, view_y = 0, 0, 64
+
+-- Phase 5B: ore clusters
+local CLUSTER_RADIUS = 4
+local clusters       = {}
+
+-- Phase 5C: live ore feed (declared here so renderFooter can see it)
+local ORE_FEED     = {}
+local ORE_FEED_MAX = 8
 
 -- ============================================================
 -- PHASE 5A: MAP PERSISTENCE
@@ -798,14 +813,6 @@ end
 
 -- ============================================================
 -- PHASE 5B: ORE CLUSTER DETECTION
--- Groups nearby ore reports into clusters instead of dispatching
--- one GOTO per individual block. When a new ore arrives, check
--- if it is within CLUSTER_RADIUS of an existing cluster centre.
--- If yes, merge it in (update centroid). If no, create a new cluster.
--- Only dispatch when the cluster has not been dispatched yet.
--- ============================================================
-local CLUSTER_RADIUS = 4   -- blocks; reports within this range merge
-local clusters       = {}  -- list of { ore, cx, cy, cz, count, dispatched }
 
 local function mergeOrCluster(ore_name, x, y, z)
     -- Find an existing cluster of the same ore type within CLUSTER_RADIUS
@@ -845,12 +852,7 @@ end
 
 -- ============================================================
 -- PHASE 5C: LIVE ORE FEED
--- Replaces the cycling alert ticker with a rolling feed of the
--- last 8 ore finds: time, type, finder HWID, and coordinates.
 -- ============================================================
-local ORE_FEED      = {}   -- ring buffer of { time, ore, hwid, x, y, z }
-local ORE_FEED_MAX  = 8
-
 local function pushOreFeed(ore, hwid, x, y, z)
     table.insert(ORE_FEED, {
         time = os.date("%H:%M"),
