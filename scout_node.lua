@@ -1061,10 +1061,20 @@ end
 -- Items that must NEVER be dropped into the dump chest.
 -- Checked by name fragment so "diamond_pickaxe" and
 -- "advancedperipherals:geo_scanner" are both caught.
-local function isTool(detail)
+-- Items that must NEVER be dropped into the dump chest or thrown
+-- away during fuel grab. Matched by name fragment AND by checking
+-- against the known scanner slot from the HW map.
+local function isTool(detail, slot)
     if not detail then return false end
     local n = tostring(detail.name or "")
-    return n:find("pickaxe") ~= nil or n:find("geo_scanner") ~= nil
+    -- Match pickaxe or geo scanner by name
+    if n:find("pickaxe")    ~= nil then return true end
+    if n:find("geo_scanner") ~= nil then return true end
+    -- Also protect by exact item name for belt-and-suspenders safety
+    if n == SCANNER_ITEM then return true end
+    -- Also protect the known scanner slot regardless of what name returns
+    if slot and HW.scanner_slot and slot == HW.scanner_slot then return true end
+    return false
 end
 
 local function returnAndDump(resumePos)
@@ -1074,10 +1084,10 @@ local function returnAndDump(resumePos)
     if not moveTo({x=dump.x,y=dump.y+1,z=dump.z}) then
         log("DUMP","Could not reach DUMP_CHEST. Parking 10s."); sleep(10); return
     end
-    for i=1,15 do
+    for i=1,16 do
         if turtle.getItemCount(i) > 0 then
             local detail = turtle.getItemDetail(i)
-            if isTool(detail) then
+            if isTool(detail, i) then
                 log("DUMP","Keeping tool in slot "..i..": "..(detail.name or "?"))
             else
                 turtle.select(i); turtle.dropDown()
@@ -1086,8 +1096,8 @@ local function returnAndDump(resumePos)
     end
     turtle.select(1)
     local leftover = false
-    for i=1,15 do
-        if turtle.getItemCount(i) > 0 and not isTool(turtle.getItemDetail(i)) then
+    for i=1,16 do
+        if turtle.getItemCount(i) > 0 and not isTool(turtle.getItemDetail(i), i) then
             leftover = true; break
         end
     end
@@ -1113,7 +1123,7 @@ local function grabFuelFromBase()
         turtle.select(s)
         if turtle.getItemCount(s)>0 and not turtle.refuel(0) then
             -- Never throw away tools, even if they ended up in a cargo slot
-            if not isTool(turtle.getItemDetail(s)) then
+            if not isTool(turtle.getItemDetail(s), s) then
                 turtle.dropDown()
             end
         end
@@ -1457,10 +1467,10 @@ local function state_RTB_DUMP()
     end
 
     if moveTo({x=dump.x, y=dump.y+1, z=dump.z}) then
-        for i=1,15 do
+        for i=1,16 do
             if turtle.getItemCount(i) > 0 then
                 local detail = turtle.getItemDetail(i)
-                if isTool(detail) then
+                if isTool(detail, i) then
                     log("DUMP","Keeping tool in slot "..i..": "..(detail and detail.name or "?"))
                 else
                     turtle.select(i); turtle.dropDown()
@@ -1470,8 +1480,8 @@ local function state_RTB_DUMP()
         turtle.select(1)
 
         local leftover = false
-        for i=1,15 do
-            if turtle.getItemCount(i)>0 and not isTool(turtle.getItemDetail(i)) then
+        for i=1,16 do
+            if turtle.getItemCount(i)>0 and not isTool(turtle.getItemDetail(i), i) then
                 leftover=true; break
             end
         end
@@ -1514,7 +1524,7 @@ local function state_RTB_FUEL()
         for s=1,15 do
             turtle.select(s)
             if turtle.getItemCount(s)>0 and not turtle.refuel(0) then
-                if not isTool(turtle.getItemDetail(s)) then turtle.dropDown() end
+                if not isTool(turtle.getItemDetail(s), s) then turtle.dropDown() end
             end
         end
         turtle.select(1)
