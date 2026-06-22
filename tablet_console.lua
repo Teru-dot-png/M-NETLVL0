@@ -139,14 +139,38 @@ local function selectedBot()
     return fleet[selected_index]
 end
 
+local drawUI
+
 local function prompt(label)
     local w, h = term.getSize()
-    term.setCursorPos(1, h)
-    term.clearLine()
-    write(fit(label, w))
+    local boxW = math.max(20, math.min(w - 2, math.max(#label + 6, 24)))
+    local boxH = 7
+    local x = math.max(1, math.floor((w - boxW) / 2) + 1)
+    local y = math.max(1, math.floor((h - boxH) / 2) + 1)
+
+    local function fillRow(rowY, text, fg, bg)
+        term.setCursorPos(x, rowY)
+        term.blit(fit(text, boxW), string.rep(fg, boxW), string.rep(bg, boxW))
+    end
+
+    -- Frame
+    fillRow(y, "+" .. string.rep("-", boxW - 2) .. "+", "f", "7")
+    fillRow(y + 1, "|" .. fit(" INPUT ", boxW - 2) .. "|", "f", "8")
+    fillRow(y + 2, "|" .. string.rep(" ", boxW - 2) .. "|", "f", "8")
+    fillRow(y + 3, "| " .. fit(label, boxW - 4) .. " |", "0", "8")
+    fillRow(y + 4, "| " .. fit("", boxW - 4) .. " |", "f", "0")
+    fillRow(y + 5, "|" .. fit("(blank = cancel)", boxW - 2) .. "|", "7", "8")
+    fillRow(y + 6, "+" .. string.rep("-", boxW - 2) .. "+", "f", "7")
+
+    term.setCursorPos(x + 2, y + 4)
+    term.setTextColor(colors.white)
+    term.setBackgroundColor(colors.black)
+    term.setCursorBlink(true)
     local line = read()
-    term.setCursorPos(1, h)
-    term.clearLine()
+    term.setCursorBlink(false)
+
+    -- Restore full cockpit after modal closes.
+    drawUI()
     return trim(line)
 end
 
@@ -199,7 +223,7 @@ local function cmdHint(w)
     return fit("s sync | l gps | q quit", w)
 end
 
-local function drawUI()
+function drawUI()
     local w, h = term.getSize()
     local cockpitBlue = "b"
     local glassBg = "7"
