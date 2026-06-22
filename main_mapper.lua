@@ -68,6 +68,10 @@ local LANE_SPACING = 4                   -- blocks between parallel tunnels
 local HB_TIMEOUT   = 12000
 local DISP_REFRESH = 0.5
 
+-- Web Dashboard: set this to your PC's IP running web_overseer.py.
+-- Leave nil to disable. Example: "http://192.168.1.50:8080"
+local WEB_API_URL  = nil
+
 -- Zone tracking: zones[hwid] = { dir, lane_offset, exhausted }
 -- When a turtle reports DONE or PARKED after a full run,
 -- its zone is marked exhausted so it gets fresh coords next time.
@@ -78,6 +82,22 @@ local lane_counters = {      -- how many lanes assigned per direction
 local fleet = {}
 local park_claim_by_hwid = {}
 local park_claim_by_key  = {}
+
+-- Web bridge: geo voxels queued here and flushed by webSyncThread.
+local web_geo_queue  = {}   -- {x,y,z,name}
+local WEB_GEO_BATCH  = 200  -- max voxels per POST
+
+local function webPost(path, data)
+    if not WEB_API_URL then return end
+    pcall(function()
+        local resp = http.post(
+            WEB_API_URL .. path,
+            textutils.serialiseJSON(data),
+            { ["Content-Type"] = "application/json" }
+        )
+        if resp then resp.close() end
+    end)
+end
 
 local function parkPosKey(p)
     return math.floor(p.x)..":"..math.floor(p.y)..":"..math.floor(p.z)
@@ -566,6 +586,7 @@ local MAX_ALERTS = 8
 local function pushAlert(msg)
     table.insert(alert_log, os.date("%H:%M ") .. msg)
     if #alert_log > MAX_ALERTS then table.remove(alert_log, 1) end
+    webPost("/api/alert", { msg = msg })
 end
 
 -- ── Blit helpers ───────────────────────────────────────────────────────
@@ -1489,6 +1510,7 @@ local function handleOreReport(msg)
 
     -- Push to live feed
     pushOreFeed(ore_key, msg.hwid, x, y, z)
+    webPost("/api/ore", { hwid = msg.hwid, ore = ore_key, x = x, y = y, z = z })
 
     -- Phase 5B: cluster-aware dispatch
     if WANT_LIST[ore_key] then
@@ -1552,6 +1574,10 @@ local function handleGeoData(msg)
                     else
                         -- Rock-like solids are tracked only in RAM.
                         volatile_solids[k] = { x=ax, y=ay, z=az, ts=now }
+                    end
+                    -- Queue for web dashboard (all non-air solids including rock)
+                    if WEB_API_URL then
+                        web_geo_queue[#web_geo_queue+1] = { x=ax, y=ay, z=az, name=b.name }
                     end
                 end
             end
@@ -2036,6 +2062,88 @@ local function terminalThread()
 end
 
 -- ============================================================
+-- WEB SYNC THREAD
+-- Posts fleet snapshots and queued voxels to web_overseer.py.
+-- Also polls for commands typed in the web terminal and runs them.
+-- ============================================================
+local function processWebCmd(cmd_str)
+    local parts = {}
+    for w in cmd_str:gmatch("%S+") do parts[#parts+1] = w end
+    local cmd = (parts[1] or ""):lower()
+    local result = "OK"
+    if cmd == "start" then
+        rednet.broadcast({ type = "CMD_START" }, PROTOCOL)
+        clearAllParkClaims()
+        print("[WEB]    start from web UI.")
+    elseif cmd == "stop" then
+        rednet.broadcast({ type = "CMD_STOP" }, PROTOCOL)
+        print("[WEB]    stop from web UI.")
+    elseif cmd == "recall" then
+        rednet.broadcast({ type = "CMD_RECALL" }, PROTOCOL)
+        print("[WEB]    recall from web UI.")
+    elseif cmd == "getme" and parts[2] and tonumber(parts[3]) then
+        local ok, err = startGetmeOrder(parts[2], parts[3])
+        result = ok and "Order started" or tostring(err)
+        print("[WEB]    getme " .. parts[2] .. " x" .. parts[3])
+    elseif cmd == "cancelorder" and parts[2] then
+        active_orders[parts[2]] = nil
+        result = "Cancelled"
+        print("[WEB]    cancelorder " .. parts[2])
+    else
+        result = "Unknown command: " .. cmd_str
+    end
+    webPost("/api/result", { cmd = cmd_str, result = result })
+end
+
+local function webSyncThread()
+    if not WEB_API_URL then return end
+    print("[WEB]    Web sync active -> " .. WEB_API_URL)
+    while true do
+        sleep(2)
+
+        -- 1. Flush geo queue in batches
+        while #web_geo_queue > 0 do
+            local batch = {}
+            local take = math.min(#web_geo_queue, WEB_GEO_BATCH)
+            for i = 1, take do batch[i] = web_geo_queue[i] end
+            for i = 1, take do table.remove(web_geo_queue, 1) end
+            webPost("/api/geo", { pos = {x=0,y=0,z=0}, scan_data = batch })
+        end
+
+        -- 2. Fleet snapshot
+        local snap = {}
+        for hwid, f in pairs(fleet) do
+            local p = f.pos or {x=0,y=0,z=0}
+            snap[hwid] = {
+                hwid   = hwid,
+                status = f.status or "?",
+                fuel   = f.fuel   or 0,
+                free   = f.free   or 0,
+                pos    = { x = p.x or 0, y = p.y or 0, z = p.z or 0 },
+            }
+        end
+        webPost("/api/fleet", { fleet = snap })
+
+        -- 3. Poll for queued web commands
+        if WEB_API_URL and http then
+            local ok, resp = pcall(http.get, WEB_API_URL .. "/api/poll")
+            if ok and resp then
+                local body = resp.read()
+                resp.close()
+                local data = textutils.unserialiseJSON(body or "")
+                if type(data) == "table" and type(data.cmds) == "table" then
+                    for _, entry in ipairs(data.cmds) do
+                        if type(entry.cmd) == "string" then
+                            processWebCmd(entry.cmd)
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- ============================================================
 -- ENTRY POINT
 -- ============================================================
 loadConfig()
@@ -2055,4 +2163,4 @@ print("  Type  help  for the command list.")
 print("  Waiting for miners to enlist...")
 print("")
 
-parallel.waitForAll(listenerThread, prunerThread, displayThread, terminalThread, mapSaveThread, orderThread)
+parallel.waitForAll(listenerThread, prunerThread, displayThread, terminalThread, mapSaveThread, orderThread, webSyncThread)

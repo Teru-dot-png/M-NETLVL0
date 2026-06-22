@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>CAT FREIGHT // O-NET OVERSEER</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700;800&display=swap');
+        :root { --cat-yellow:#facc15; --cat-black:#09090b; }
+        * { -webkit-tap-highlight-color:transparent; box-sizing:border-box; }
+        body { font-family:'JetBrains Mono',monospace; background-color:var(--cat-black); color:#e4e4e7; overscroll-behavior:none; }
+        .bg-hazard { background-image:repeating-linear-gradient(-45deg,#000,#000 10px,#facc15 10px,#facc15 20px); }
+        ::-webkit-scrollbar{width:6px;height:6px}
+        ::-webkit-scrollbar-track{background:#18181b}
+        ::-webkit-scrollbar-thumb{background:#3f3f46;border-radius:3px}
+        ::-webkit-scrollbar-thumb:hover{background:#facc15}
+        .industrial-panel{background-color:#18181b;display:flex;flex-direction:column;overflow:hidden}
+        .panel-header{background-color:#27272a;color:#facc15;text-transform:uppercase;font-weight:800;letter-spacing:.05em;padding:.5rem 1rem;display:flex;justify-content:space-between;align-items:center;border-bottom:2px solid #3f3f46}
+        .scanlines::after{content:" ";display:block;position:absolute;inset:0;background:linear-gradient(to bottom,rgba(255,255,255,0),rgba(255,255,255,0) 50%,rgba(0,0,0,.2) 50%,rgba(0,0,0,.2));background-size:100% 4px;pointer-events:none}
+        @media(max-width:1023px){
+            #app-grid{display:flex;flex-direction:column;flex-grow:1;position:relative}
+            .mobile-view{position:absolute;inset:0;display:none;flex-direction:column;background-color:var(--cat-black)}
+            .mobile-view.active{display:flex;animation:fadeIn .2s ease-out}
+            @keyframes fadeIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:translateY(0)}}
+        }
+        @media(min-width:1024px){
+            #app-grid{display:grid;grid-template-columns:2fr 1fr;grid-template-rows:1fr 1fr;grid-template-areas:"map fleet" "map term";gap:1rem;padding:1rem}
+            .mobile-view{display:flex!important;position:relative;border:2px solid #3f3f46;box-shadow:inset 0 0 20px rgba(0,0,0,.5)}
+            #view-map{grid-area:map}
+            #view-fleet{grid-area:fleet}
+            #view-term{grid-area:term}
+        }
+        button:active{transform:translateY(2px)}
+        .touch-btn{transition:all .1s}
+        .status-chip{display:inline-block;padding:1px 6px;border-radius:2px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.05em}
+    </style>
+</head>
+<body class="h-[100dvh] w-full flex flex-col overflow-hidden">
+
+<!-- ── Header ── -->
+<header class="flex-shrink-0 border-b-4 border-yellow-400 bg-zinc-900 flex justify-between items-center p-3 lg:p-4 z-20 shadow-md">
+    <div class="flex items-center gap-3">
+        <div class="h-10 w-10 bg-hazard border-2 border-yellow-400 flex-shrink-0 shadow-[0_0_10px_rgba(250,204,21,0.2)]"></div>
+        <div class="flex flex-col justify-center">
+            <h1 class="text-xl lg:text-2xl font-extrabold text-yellow-400 tracking-wider leading-none">CAT FREIGHT</h1>
+            <h2 class="text-[10px] lg:text-xs text-zinc-400 tracking-widest uppercase mt-1">O-NET V1 Overseer</h2>
+        </div>
+    </div>
+    <div class="text-right flex flex-col items-end flex-shrink-0 gap-1">
+        <div class="flex items-center gap-2">
+            <span class="relative flex h-2 w-2 lg:h-3 lg:w-3">
+                <span id="link-ping" class="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
+                <span id="link-dot"  class="relative inline-flex rounded-full h-2 w-2 lg:h-3 lg:w-3 bg-red-500"></span>
+            </span>
+            <span id="link-label" class="text-red-500 font-bold uppercase tracking-widest text-xs lg:text-sm">NO LINK</span>
+        </div>
+        <div class="flex gap-3 text-[10px] text-zinc-500 font-mono">
+            <span id="stat-voxels">0 voxels</span>
+            <span id="clock">00:00:00 UTC</span>
+        </div>
+    </div>
+</header>
+
+<main id="app-grid">
+
+    <!-- ── MAP VIEW ── -->
+    <section id="view-map" class="mobile-view active industrial-panel">
+        <div class="panel-header hidden lg:flex">
+            <span>Voxel Cartography</span>
+            <div class="flex items-center gap-3 text-xs text-zinc-400">
+                <span id="map-vox-count">0 vox</span>
+                <span>LIVE FEED</span>
+            </div>
+        </div>
+        <div class="flex-grow relative scanlines bg-black min-h-0" id="map-wrapper">
+            <canvas id="voxelMap" class="absolute inset-0 w-full h-full" style="image-rendering:pixelated"></canvas>
+            <!-- Mobile coord hud -->
+            <div class="absolute inset-x-0 top-4 px-4 flex justify-center pointer-events-none lg:hidden">
+                <div class="pointer-events-auto bg-black/80 backdrop-blur-sm border border-yellow-400/50 text-yellow-400 px-4 py-2 rounded shadow-lg text-xs font-bold text-center">
+                    <span id="m-coord-x">X:0</span>&nbsp;|&nbsp;
+                    <span id="m-coord-y" class="text-white">Y:64</span>&nbsp;|&nbsp;
+                    <span id="m-coord-z">Z:0</span>
+                </div>
+            </div>
+            <!-- Mobile pan controls -->
+            <div class="absolute bottom-4 left-4 pointer-events-none lg:hidden">
+                <div class="grid grid-cols-3 gap-1 w-32 pointer-events-auto opacity-80 hover:opacity-100">
+                    <button onclick="panMap(0,-1)" class="col-start-2 touch-btn w-full bg-zinc-800 text-yellow-400 py-3 rounded border-b-4 border-zinc-950 font-bold text-sm">N</button>
+                    <button onclick="panMap(-1,0)" class="col-start-1 row-start-2 touch-btn w-full bg-zinc-800 text-yellow-400 py-3 rounded border-b-4 border-zinc-950 font-bold text-sm">W</button>
+                    <button onclick="panMap(0,1)"  class="col-start-2 row-start-2 touch-btn w-full bg-zinc-800 text-yellow-400 py-3 rounded border-b-4 border-zinc-950 font-bold text-sm">S</button>
+                    <button onclick="panMap(1,0)"  class="col-start-3 row-start-2 touch-btn w-full bg-zinc-800 text-yellow-400 py-3 rounded border-b-4 border-zinc-950 font-bold text-sm">E</button>
+                </div>
+            </div>
+            <div class="absolute bottom-4 right-4 pointer-events-none lg:hidden">
+                <div class="flex flex-col gap-2 w-16 pointer-events-auto opacity-80 hover:opacity-100">
+                    <button onclick="changeY(1)"  class="touch-btn bg-zinc-800 text-yellow-400 py-3 rounded border-b-4 border-zinc-950 font-bold text-sm">Y▲</button>
+                    <button onclick="changeY(-1)" class="touch-btn bg-zinc-800 text-yellow-400 py-3 rounded border-b-4 border-zinc-950 font-bold text-sm">Y▼</button>
+                </div>
+            </div>
+        </div>
+        <!-- Desktop map controls -->
+        <div class="hidden lg:flex bg-zinc-900 border-t-2 border-yellow-400 p-3 justify-between items-center">
+            <div class="flex items-center gap-6">
+                <div class="grid grid-cols-3 gap-1 w-32">
+                    <button onclick="panMap(0,-1)" class="col-start-2 touch-btn bg-zinc-700 hover:bg-yellow-500 hover:text-black text-white py-1.5 font-bold rounded-sm border-b-2 border-zinc-900 text-sm">N</button>
+                    <button onclick="panMap(-1,0)" class="col-start-1 row-start-2 touch-btn bg-zinc-700 hover:bg-yellow-500 hover:text-black text-white py-1.5 font-bold rounded-sm border-b-2 border-zinc-900 text-sm">W</button>
+                    <button onclick="panMap(0,1)"  class="col-start-2 row-start-2 touch-btn bg-zinc-700 hover:bg-yellow-500 hover:text-black text-white py-1.5 font-bold rounded-sm border-b-2 border-zinc-900 text-sm">S</button>
+                    <button onclick="panMap(1,0)"  class="col-start-3 row-start-2 touch-btn bg-zinc-700 hover:bg-yellow-500 hover:text-black text-white py-1.5 font-bold rounded-sm border-b-2 border-zinc-900 text-sm">E</button>
+                </div>
+                <div class="flex flex-col gap-1 w-20">
+                    <button onclick="changeY(1)"  class="touch-btn bg-zinc-700 hover:bg-yellow-500 hover:text-black text-white py-1 font-bold rounded-sm text-xs border-b-2 border-zinc-900 flex justify-between px-2"><span>Y</span><span>▲</span></button>
+                    <button onclick="changeY(-1)" class="touch-btn bg-zinc-700 hover:bg-yellow-500 hover:text-black text-white py-1 font-bold rounded-sm text-xs border-b-2 border-zinc-900 flex justify-between px-2"><span>Y</span><span>▼</span></button>
+                </div>
+            </div>
+            <div class="text-center font-bold text-yellow-400 border-2 border-yellow-400 bg-black px-6 py-2">
+                <div class="text-[10px] text-zinc-500 mb-1 tracking-widest">TARGET COORDS</div>
+                <span id="d-coord-x" class="mx-2">X: 0</span>|
+                <span id="d-coord-y" class="mx-2 text-white">Y: 64</span>|
+                <span id="d-coord-z" class="mx-2">Z: 0</span>
+            </div>
+        </div>
+    </section>
+
+    <!-- ── FLEET VIEW ── -->
+    <section id="view-fleet" class="mobile-view industrial-panel">
+        <div class="panel-header lg:border-t-0">
+            <span>Fleet Telemetry</span>
+            <span class="text-xs font-normal bg-zinc-800 px-2 py-1 rounded" id="fleet-count">0 ONLINE</span>
+        </div>
+        <div class="p-3 bg-zinc-900 border-b border-zinc-800 grid grid-cols-3 gap-2 flex-shrink-0 shadow-lg">
+            <button onclick="webCmd('start')" class="touch-btn bg-yellow-500 text-black font-extrabold py-3 text-xs uppercase tracking-wider rounded border-b-4 border-yellow-700 shadow-md">Deploy</button>
+            <button onclick="webCmd('stop')"  class="touch-btn bg-zinc-300 text-black font-extrabold py-3 text-xs uppercase tracking-wider rounded border-b-4 border-zinc-500 shadow-md">Halt</button>
+            <button onclick="webCmd('recall')"class="touch-btn bg-red-700 text-white font-extrabold py-3 text-xs uppercase tracking-wider rounded border-b-4 border-red-900 shadow-md">Recall</button>
+        </div>
+        <div class="overflow-y-auto flex-grow bg-black p-3" id="fleet-roster"></div>
+    </section>
+
+    <!-- ── TERMINAL VIEW ── -->
+    <section id="view-term" class="mobile-view industrial-panel">
+        <div class="panel-header lg:border-t-0">
+            <span>Terminal Uplink</span>
+            <span class="text-xs font-normal text-zinc-500" id="ore-ticker">—</span>
+        </div>
+        <div id="terminal-output" class="flex-grow bg-black text-yellow-500 p-3 overflow-y-auto text-xs font-mono break-words leading-relaxed whitespace-pre-wrap shadow-inner pb-6"></div>
+        <div class="flex border-t-2 border-zinc-700 bg-zinc-900 items-center flex-shrink-0 p-2 gap-2">
+            <span class="text-yellow-500 font-bold pl-2">&gt;</span>
+            <input type="text" id="cmd-input"
+                class="w-full bg-black text-white rounded border border-zinc-700 focus:border-yellow-400 focus:outline-none p-3 text-sm font-mono"
+                placeholder="Command: start · stop · recall · getme diamond 64"
+                autocomplete="off" spellcheck="false">
+            <button onclick="submitCmd()" class="bg-yellow-500 hover:bg-yellow-400 text-black font-bold p-3 rounded shrink-0 touch-btn">
+                <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" fill="currentColor" viewBox="0 0 256 256">
+                    <path d="M227.32,121.62,43.32,29.62A8,8,0,0,0,32.53,39l31,89-31,89a8,8,0,0,0,10.79,9.38l184-92A8,8,0,0,0,227.32,121.62ZM48.64,204.64,74.1,136H136a8,8,0,0,0,0-16H74.1L48.64,51.36,202,128Z"/>
+                </svg>
+            </button>
+        </div>
+    </section>
+
+</main>
+
+<!-- ── Mobile nav ── -->
+<nav class="lg:hidden flex-shrink-0 bg-zinc-900 border-t border-zinc-800 flex h-[68px] pb-safe z-50">
+    <button id="nav-map"   onclick="switchTab('map')"   class="nav-btn flex-1 flex flex-col items-center justify-center gap-1 text-yellow-400 bg-zinc-800 border-t-2 border-yellow-400 transition-colors">
+        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="currentColor" viewBox="0 0 256 256"><path d="M228.92,49.69a8,8,0,0,0-6.86-1.45L160.93,63.52,99.58,32.68a8,8,0,0,0-7.16,0L27.06,65.36A8,8,0,0,0,24,72.53v136a8,8,0,0,0,10.86,7.52l60.19-21.24,61.35,30.84a8,8,0,0,0,7.16,0l65.36-32.68A8,8,0,0,0,232,185.47v-136A8,8,0,0,0,228.92,49.69ZM96,49.4l56,28.14v129l-56-28.14ZM40,78.22l40-14.12v129.1L40,207.32Zm176,99.56-40,20V68.68l40-20Z"/></svg>
+        <span class="text-[10px] font-bold tracking-widest uppercase">Map</span>
+    </button>
+    <button id="nav-fleet" onclick="switchTab('fleet')" class="nav-btn flex-1 flex flex-col items-center justify-center gap-1 text-zinc-500 border-t-2 border-transparent hover:text-zinc-300 transition-colors bg-zinc-900">
+        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="currentColor" viewBox="0 0 256 256"><path d="M224,112H192V64a16,16,0,0,0-16-16H80A16,16,0,0,0,64,64v48H32a16,16,0,0,0-16,16v80a16,16,0,0,0,16,16H224a16,16,0,0,0,16-16V128A16,16,0,0,0,224,112ZM80,64h96v48H80ZM224,208H32V128H224v80Zm-64-48a8,8,0,0,1-8,8H104a8,8,0,0,1,0-16h48A8,8,0,0,1,160,160Z"/></svg>
+        <span class="text-[10px] font-bold tracking-widest uppercase">Fleet</span>
+    </button>
+    <button id="nav-term"  onclick="switchTab('term')"  class="nav-btn flex-1 flex flex-col items-center justify-center gap-1 text-zinc-500 border-t-2 border-transparent hover:text-zinc-300 transition-colors bg-zinc-900">
+        <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" fill="currentColor" viewBox="0 0 256 256"><path d="M216,40H40A16,16,0,0,0,24,56V200a16,16,0,0,0,16,16H216a16,16,0,0,0,16-16V56A16,16,0,0,0,216,40ZM40,56H216V152H40ZM216,200H40V168H216v32Zm-48-16h32a8,8,0,0,1,0,16H168a8,8,0,0,1,0-16Zm-69.66-69.66-32-32a8,8,0,0,1,11.32-11.32L106.34,104l-28.68,28.69a8,8,0,0,1-11.32-11.32Z"/></svg>
+        <span class="text-[10px] font-bold tracking-widest uppercase">Uplink</span>
+    </button>
+</nav>
+
+<script>
+/* =========================================================================
+   CONFIG — point this at your web_overseer.py instance.
+   In dev, leave empty (same origin). In production set e.g.:
+   const API = "http://192.168.1.100:8080"
+   ========================================================================= */
+const API = '';
+
+/* =========================================================================
+   STATE
+   ========================================================================= */
+const view = { x: 0, y: 64, z: 0 };
+const live = {
+    fleet:      {},
+    ore_feed:   [],
+    alerts:     [],
+    cmd_results:[],
+    stats:      { voxels: 0 },
+    linked:     false,
+    last_t:     0,
+};
+
+// map tile cache: key "x:z" → name  (refreshed every MAP_POLL_MS)
+let mapCache = {};
+let mapCacheKey = null;     // serialised viewport used to detect changes
+let mapFetchInProgress = false;
+const TILE_PX = 20;
+const MAP_POLL_MS  = 1500;
+const STATE_POLL_MS = 1500;
+
+let expandedCard = null;
+
+/* =========================================================================
+   NAVIGATION
+   ========================================================================= */
+function switchTab(id) {
+    ['map','fleet','term'].forEach(v => {
+        document.getElementById(`view-${v}`).classList.toggle('active', v === id);
+        const btn = document.getElementById(`nav-${v}`);
+        if (!btn) return;
+        btn.className = v === id
+            ? 'nav-btn flex-1 flex flex-col items-center justify-center gap-1 text-yellow-400 bg-zinc-800 border-t-2 border-yellow-400 transition-colors'
+            : 'nav-btn flex-1 flex flex-col items-center justify-center gap-1 text-zinc-500 border-t-2 border-transparent hover:text-zinc-300 transition-colors bg-zinc-900';
+    });
+    if (id === 'map') setTimeout(resizeCanvas, 10);
+}
+
+setInterval(() => {
+    document.getElementById('clock').innerText = new Date().toISOString().split('T')[1].split('.')[0] + ' UTC';
+}, 1000);
+
+/* =========================================================================
+   LINK INDICATOR
+   ========================================================================= */
+function setLink(ok) {
+    live.linked = ok;
+    document.getElementById('link-ping').className = `animate-ping absolute inline-flex h-full w-full rounded-full ${ok ? 'bg-green-400' : 'bg-red-400'} opacity-75`;
+    document.getElementById('link-dot').className  = `relative inline-flex rounded-full h-2 w-2 lg:h-3 lg:w-3 ${ok ? 'bg-green-500' : 'bg-red-500'}`;
+    document.getElementById('link-label').className= `${ok ? 'text-green-500' : 'text-red-500'} font-bold uppercase tracking-widest text-xs lg:text-sm`;
+    document.getElementById('link-label').innerText = ok ? 'UPLINK OK' : 'NO LINK';
+}
+
+/* =========================================================================
+   TERMINAL
+   ========================================================================= */
+const termEl = document.getElementById('terminal-output');
+const cmdInput = document.getElementById('cmd-input');
+
+function logTerm(msg, color = 'text-zinc-300') {
+    const t = new Date().toISOString().split('T')[1].split('.')[0];
+    const el = document.createElement('div');
+    el.className = 'mb-1';
+    el.innerHTML = `<span class="text-zinc-600">[${t}]</span> <span class="${color}">${msg}</span>`;
+    termEl.appendChild(el);
+    termEl.scrollTop = termEl.scrollHeight;
+}
+
+async function webCmd(cmd) {
+    logTerm(`> ${cmd}`, 'text-yellow-400 font-bold');
+    try {
+        const r = await fetch(`${API}/api/cmd`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ cmd }),
+        });
+        const d = await r.json();
+        if (d.ok) logTerm(`[CMD] "${cmd}" queued for CC overseer.`, 'text-green-400');
+        else logTerm(`[ERR] ${JSON.stringify(d)}`, 'text-red-400');
+    } catch(e) {
+        logTerm(`[ERR] Cannot reach web_overseer.py: ${e.message}`, 'text-red-400');
+    }
+}
+
+function submitCmd() {
+    const val = cmdInput.value.trim();
+    if (!val) return;
+    if (val === 'clear') { termEl.innerHTML = ''; cmdInput.value = ''; return; }
+    if (val === 'help') {
+        logTerm('Commands (sent to CC overseer):', 'text-yellow-500 font-bold');
+        logTerm('  start | stop | recall      fleet controls');
+        logTerm('  getme <ore> <count>         e.g. getme diamond 64');
+        logTerm('  newrun <hwid>               fresh lane for parked bot');
+        logTerm('  setdump x y z              update dump chest coords');
+        logTerm('  clear                       clear this terminal');
+        cmdInput.value = '';
+        return;
+    }
+    webCmd(val);
+    cmdInput.value = '';
+}
+
+cmdInput.addEventListener('keydown', e => { if (e.key === 'Enter') submitCmd(); });
+
+/* =========================================================================
+   FLEET RENDERING
+   ========================================================================= */
+function statusStyle(st) {
+    const s = (st||'').toUpperCase();
+    if (s==='MINING')     return {color:'text-green-400', bg:'bg-green-900/40',  dot:'bg-green-400'};
+    if (s==='STANDBY')    return {color:'text-yellow-500',bg:'bg-yellow-900/40', dot:'bg-yellow-400'};
+    if (s==='PARKED')     return {color:'text-zinc-500',  bg:'bg-zinc-900',      dot:'bg-zinc-500'};
+    if (s==='RTB_DUMP')   return {color:'text-orange-400',bg:'bg-orange-900/40', dot:'bg-orange-400'};
+    if (s==='RTB_FUEL')   return {color:'text-red-500',   bg:'bg-red-900/40',    dot:'bg-red-500'};
+    if (s==='GOTO')       return {color:'text-cyan-400',  bg:'bg-cyan-900/40',   dot:'bg-cyan-400'};
+    if (s==='FETCH_PICK') return {color:'text-purple-400',bg:'bg-purple-900/40', dot:'bg-purple-400'};
+    return {color:'text-zinc-300', bg:'bg-zinc-800', dot:'bg-zinc-400'};
+}
+
+function renderFleet() {
+    const roster = document.getElementById('fleet-roster');
+    const bots = Object.values(live.fleet);
+    document.getElementById('fleet-count').innerText = `${bots.length} ONLINE`;
+    roster.innerHTML = '';
+
+    if (bots.length === 0) {
+        roster.innerHTML = '<div class="text-zinc-600 text-sm p-4 text-center">No miners enlisted.<br>Boot miners and set overseer URL.</div>';
+        return;
+    }
+
+    bots.sort((a,b) => (a.hwid||'').localeCompare(b.hwid||''));
+    bots.forEach(bot => {
+        const st = statusStyle(bot.status);
+        const fuelPct = Math.min(100, Math.max(0, ((bot.fuel||0) / 2000) * 100));
+        const fuelCol = (bot.fuel||0) < 200 ? 'bg-red-500' : (bot.fuel||0) < 500 ? 'bg-yellow-500' : 'bg-green-500';
+        const p = bot.pos || {x:0,y:0,z:0};
+        const isExp = expandedCard === bot.hwid;
+
+        const div = document.createElement('div');
+        div.className = `border-b border-zinc-800 p-3 transition-all cursor-pointer ${isExp ? 'bg-zinc-900' : 'hover:bg-zinc-900/50'}`;
+        div.innerHTML = `
+            <div class="flex items-center justify-between gap-2" onclick="toggleCard('${bot.hwid}')">
+                <div class="flex items-center gap-2 min-w-0">
+                    <span class="inline-block w-2 h-2 rounded-full flex-shrink-0 ${st.dot}"></span>
+                    <span class="font-bold text-zinc-100 text-sm tracking-wide truncate">${bot.hwid||'?'}</span>
+                </div>
+                <div class="flex items-center gap-3 flex-shrink-0">
+                    <span class="${st.color} font-bold text-xs tracking-wider uppercase">${bot.status||'?'}</span>
+                    <div class="w-14 h-2 bg-zinc-950 border border-zinc-700 rounded-sm overflow-hidden">
+                        <div class="h-full ${fuelCol}" style="width:${fuelPct}%"></div>
+                    </div>
+                    <span class="text-zinc-500 text-xs w-10 text-right">${bot.fuel||0}</span>
+                </div>
+            </div>
+            ${isExp ? `
+            <div class="mt-3 pt-3 border-t border-zinc-700">
+                <div class="grid grid-cols-3 gap-2 text-xs text-zinc-400 mb-3">
+                    <div class="bg-zinc-950 p-2 rounded"><div class="text-[10px] text-zinc-600 mb-1">POSITION</div>
+                        <div class="text-yellow-400">${p.x},${p.y},${p.z}</div></div>
+                    <div class="bg-zinc-950 p-2 rounded"><div class="text-[10px] text-zinc-600 mb-1">FREE SLOTS</div>
+                        <div class="text-white">${bot.free||'?'}</div></div>
+                    <div class="bg-zinc-950 p-2 rounded"><div class="text-[10px] text-zinc-600 mb-1">FUEL</div>
+                        <div class="${(bot.fuel||0)<200?'text-red-400':'text-white'}">${bot.fuel||0}</div></div>
+                </div>
+                <div class="flex gap-2">
+                    <button onclick="event.stopPropagation(); trackBot('${bot.hwid}')" class="flex-1 bg-zinc-800 hover:bg-zinc-700 text-yellow-400 font-bold py-2 border border-zinc-700 rounded text-xs uppercase tracking-wider touch-btn">📍 Track</button>
+                    <button onclick="event.stopPropagation(); webCmd('recall ${bot.hwid}')" class="flex-1 bg-zinc-800 hover:bg-red-900 text-red-400 font-bold py-2 border border-zinc-700 rounded text-xs uppercase tracking-wider touch-btn">⚠️ Recall</button>
+                </div>
+            </div>` : ''}
+        `;
+        roster.appendChild(div);
+    });
+}
+
+function toggleCard(id) {
+    expandedCard = expandedCard === id ? null : id;
+    renderFleet();
+}
+
+function trackBot(hwid) {
+    const bot = live.fleet[hwid];
+    if (!bot || !bot.pos) return;
+    view.x = bot.pos.x; view.y = bot.pos.y; view.z = bot.pos.z;
+    updateCoordDisplay();
+    refreshMapNow();
+    if (window.innerWidth < 1024) switchTab('map');
+    logTerm(`[MAP] Tracking ${hwid} → (${bot.pos.x},${bot.pos.y},${bot.pos.z})`, 'text-zinc-400');
+}
+
+/* =========================================================================
+   CANVAS MAP
+   ========================================================================= */
+const canvas = document.getElementById('voxelMap');
+const ctx    = canvas.getContext('2d');
+const wrapper= document.getElementById('map-wrapper');
+
+// Ore colour palette (matches CC overseer ore_colors)
+const ORE_COLORS = {
+    diamond:        '#22d3ee',
+    emerald:        '#4ade80',
+    gold:           '#facc15',
+    iron:           '#a1a1aa',
+    coal:           '#52525b',
+    redstone:       '#ef4444',
+    lapis:          '#3b82f6',
+    copper:         '#f97316',
+    ancient_debris: '#a855f7',
+};
+
+function oreColor(name) {
+    if (!name) return null;
+    for (const [ore, col] of Object.entries(ORE_COLORS)) {
+        if (name.includes(ore)) return col;
+    }
+    if (name.includes('_ore'))  return '#e879f9';
+    if (name.includes('chest')) return '#f59e0b';
+    if (name.includes('air') || name === '__air__') return '__air__';
+    return '#27272a';  // generic solid (stone-class)
+}
+
+function resizeCanvas() {
+    if (wrapper.clientWidth === 0) return;
+    canvas.width  = wrapper.clientWidth;
+    canvas.height = wrapper.clientHeight;
+    drawMap();
+}
+new ResizeObserver(() => resizeCanvas()).observe(wrapper);
+
+function updateCoordDisplay() {
+    ['m','d'].forEach(p => {
+        document.getElementById(`${p}-coord-x`).innerText = `${p==='d'?'X: ':'X:'}${view.x}`;
+        document.getElementById(`${p}-coord-y`).innerText = `${p==='d'?'Y: ':'Y:'}${view.y}`;
+        document.getElementById(`${p}-coord-z`).innerText = `${p==='d'?'Z: ':'Z:'}${view.z}`;
+    });
+}
+
+function panMap(dx, dz) {
+    view.x += dx * Math.max(1, Math.floor(canvas.width  / TILE_PX / 4));
+    view.z += dz * Math.max(1, Math.floor(canvas.height / TILE_PX / 4));
+    updateCoordDisplay();
+    refreshMapNow();
+}
+
+function changeY(dy) {
+    view.y += dy;
+    updateCoordDisplay();
+    logTerm(`[MAP] Y → ${view.y}`, 'text-zinc-500');
+    refreshMapNow();
+}
+
+function drawMap() {
+    if (!canvas.width) return;
+    const W = canvas.width, H = canvas.height;
+    ctx.fillStyle = '#09090b';
+    ctx.fillRect(0, 0, W, H);
+
+    const cols = Math.ceil(W / TILE_PX);
+    const rows = Math.ceil(H / TILE_PX);
+    const c0 = -Math.floor(cols / 2);
+    const r0 = -Math.floor(rows / 2);
+
+    // Draw voxels from cache
+    for (let c = 0; c < cols; c++) {
+        for (let r = 0; r < rows; r++) {
+            const wx = view.x + c0 + c;
+            const wz = view.z + r0 + r;
+            const col = oreColor(mapCache[`${wx}:${wz}`]);
+            if (!col || col === '__air__') continue;
+            const sx = c * TILE_PX, sy = r * TILE_PX;
+            ctx.fillStyle = col;
+            // Ore blocks rendered as inset gem; generic solid as flush tile
+            if (col === '#27272a') {
+                ctx.fillRect(sx, sy, TILE_PX, TILE_PX);
+            } else {
+                ctx.fillRect(sx + 3, sy + 3, TILE_PX - 6, TILE_PX - 6);
+            }
+        }
+    }
+
+    // Subtle grid lines
+    ctx.strokeStyle = 'rgba(255,255,255,0.03)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let c = 0; c <= cols; c++) { ctx.moveTo(c*TILE_PX, 0); ctx.lineTo(c*TILE_PX, H); }
+    for (let r = 0; r <= rows; r++) { ctx.moveTo(0, r*TILE_PX); ctx.lineTo(W, r*TILE_PX); }
+    ctx.stroke();
+
+    // Fleet bots
+    const now = Date.now();
+    Object.values(live.fleet).forEach(bot => {
+        const p = bot.pos;
+        if (!p || p.y !== view.y) return;
+        const sx = (p.x - view.x - c0) * TILE_PX;
+        const sy = (p.z - view.z - r0) * TILE_PX;
+        if (sx < -TILE_PX || sx > W || sy < -TILE_PX || sy > H) return;
+
+        const blink = (bot.status==='MINING'||bot.status==='GOTO') && now%1000>500;
+        if (blink) return;
+
+        const st = bot.status||'';
+        let botCol = '#facc15';
+        if (st==='MINING') botCol='#4ade80';
+        else if (st==='RTB_DUMP'||st==='RTB_FUEL') botCol='#f87171';
+        else if (st==='GOTO') botCol='#22d3ee';
+
+        ctx.fillStyle = botCol;
+        ctx.beginPath();
+        ctx.arc(sx + TILE_PX/2, sy + TILE_PX/2, TILE_PX/2 - 2, 0, Math.PI*2);
+        ctx.fill();
+
+        ctx.fillStyle = '#000';
+        ctx.font = `${TILE_PX*0.5}px JetBrains Mono,monospace`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText((bot.hwid||'?').split('-')[1]||'?', sx + TILE_PX/2, sy + TILE_PX/2);
+    });
+
+    // Crosshair at viewport centre
+    const cx = W/2, cy = H/2;
+    ctx.strokeStyle = 'rgba(250,204,21,0.6)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(cx-12,cy); ctx.lineTo(cx+12,cy);
+    ctx.moveTo(cx,cy-12); ctx.lineTo(cx,cy+12);
+    ctx.stroke();
+}
+
+/* =========================================================================
+   MAP DATA POLLING
+   ========================================================================= */
+async function fetchMapSlice() {
+    if (mapFetchInProgress) return;
+    const cols = Math.ceil(canvas.width  / TILE_PX);
+    const rows = Math.ceil(canvas.height / TILE_PX);
+    const rx = Math.ceil(cols / 2) + 4;
+    const rz = Math.ceil(rows / 2) + 4;
+    const key = `${view.x}:${view.y}:${view.z}:${rx}:${rz}`;
+    // Always re-fetch (new voxels may have arrived)
+    mapFetchInProgress = true;
+    try {
+        const r = await fetch(`${API}/api/map?cx=${view.x}&y=${view.y}&cz=${view.z}&rx=${rx}&rz=${rz}`);
+        const d = await r.json();
+        const newCache = {};
+        (d.voxels || []).forEach(v => { newCache[`${v.x}:${v.z}`] = v.n; });
+        mapCache = newCache;
+        mapCacheKey = key;
+        drawMap();
+    } catch(e) { /* silent — no link */ } finally {
+        mapFetchInProgress = false;
+    }
+}
+
+function refreshMapNow() {
+    mapCache = {};
+    mapCacheKey = null;
+    fetchMapSlice();
+}
+
+/* =========================================================================
+   STATE POLLING
+   ========================================================================= */
+async function pollState() {
+    try {
+        const r = await fetch(`${API}/api/state`);
+        if (!r.ok) throw new Error(r.status);
+        const d = await r.json();
+
+        // Fleet
+        live.fleet      = d.fleet || {};
+        live.ore_feed   = d.ore_feed || [];
+        live.alerts     = d.alerts || [];
+        live.cmd_results= d.cmd_results || [];
+        live.stats      = d.stats || {voxels:0};
+        live.last_t     = d.t;
+
+        setLink(true);
+
+        // Stats
+        const v = live.stats.voxels || 0;
+        const vs = v > 1e6 ? `${(v/1e6).toFixed(1)}M` : v > 1e3 ? `${(v/1e3).toFixed(1)}K` : v;
+        document.getElementById('stat-voxels').innerText = `${vs} voxels`;
+        document.getElementById('map-vox-count').innerText = `${vs} vox`;
+
+        renderFleet();
+
+        // Ore ticker in terminal header
+        const last = live.ore_feed[live.ore_feed.length - 1];
+        if (last) document.getElementById('ore-ticker').innerText = `${last.ore} @ ${last.x},${last.z}`;
+
+        // Print new cmd results to terminal
+        live.cmd_results.slice(-3).forEach(r => {
+            if (r._shown) return;
+            r._shown = true;
+            logTerm(`[CC] ${r.cmd} → ${r.result}`, 'text-zinc-400');
+        });
+
+    } catch(e) {
+        setLink(false);
+    }
+}
+
+/* =========================================================================
+   MAP ANIMATION LOOP
+   ========================================================================= */
+function mapLoop() {
+    drawMap();
+    requestAnimationFrame(mapLoop);
+}
+
+/* =========================================================================
+   BOOT
+   ========================================================================= */
+window.onload = () => {
+    updateCoordDisplay();
+    renderFleet();
+    logTerm('CAT FREIGHT O-NET V1 Dashboard', 'text-yellow-400 font-bold');
+    logTerm(`Connecting to ${API || window.location.origin} ...`, 'text-zinc-500');
+
+    // Initial fetches
+    pollState().then(() => {
+        logTerm('State sync OK.', 'text-green-400');
+        fetchMapSlice();
+    });
+
+    // Polling loops
+    setInterval(pollState,      STATE_POLL_MS);
+    setInterval(fetchMapSlice,  MAP_POLL_MS);
+
+    mapLoop();
+};
+</script>
+</body>
+</html>
