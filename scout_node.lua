@@ -1671,6 +1671,7 @@ end
 local current_state   = "STANDBY"
 local tunnelled       = 0
 local goto_job        = nil
+local manual_goto_active = false
 local lane_offset     = 0
 local lane_positioned = false
 local park_pos        = nil   -- assigned parking slot, nil = park in place
@@ -2042,14 +2043,28 @@ end
 -- Reports each mined block individually via ORE_MINED to the overseer.
 -- Returns to resume position and continues mining.
 local function state_GOTO()
-    if not goto_job then return "MINING" end
+    if not goto_job then return started and "MINING" or "STANDBY" end
     local job = goto_job
     goto_job  = nil
 
     local resume = copy(pos)
     local ore_name = job.ore or "ore"
+    local is_tablet_job = tostring(ore_name):find("tablet_", 1, true) == 1
     log("GOTO", string.format("Heading to %s cluster (%d,%d,%d)",
         ore_name, job.pos.x, job.pos.y, job.pos.z))
+
+    if is_tablet_job then
+        local ok = moveTo(job.pos)
+        if ok then
+            log("GOTO", "Tablet move target reached.")
+        else
+            log("GOTO", "Tablet move failed to reach target.")
+        end
+        manual_goto_active = false
+        park_pos = nil
+        started = false
+        return "STANDBY"
+    end
 
     if not pickaxeEquipped() then
         log("GOTO","No pickaxe. Skipping job.")
@@ -2144,6 +2159,11 @@ local function state_GOTO()
     moveTo(resume)
     face(my_dir)
 
+    if manual_goto_active then
+        manual_goto_active = false
+        started = false
+        return "STANDBY"
+    end
     if not started then return "STANDBY" end
     return "MINING"
 end
@@ -2183,8 +2203,8 @@ local function brainThread_inner()
     log("STAND","Ready. Awaiting CMD_START.")
 
     while true do
-        -- Queue a new GOTO job if one arrived and we are mining
-        if #jobs > 0 and current_state == "MINING" then
+        -- Queue a new GOTO job from active or idle states.
+        if #jobs > 0 and (current_state == "MINING" or current_state == "STANDBY" or current_state == "PARKED") then
             goto_job = table.remove(jobs, 1)
             setState("GOTO")
         end
@@ -2303,6 +2323,9 @@ local function listenerThread_inner()
                 log("CFG","Config updated from Overseer.")
             elseif msg.type=="GOTO" and msg.hwid==hwid and type(msg.pos)=="table" then
                 log("GOTO","Job queued: "..(msg.ore or "ore"))
+                if tostring(msg.ore or ""):find("tablet_", 1, true) == 1 then
+                    manual_goto_active = true
+                end
                 table.insert(jobs, msg)
 
             elseif msg.type=="AUTH_ACK" and msg.hwid==hwid then
