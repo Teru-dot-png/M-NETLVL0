@@ -1,40 +1,35 @@
 --[[
-    O-NET V1 | TABLET CONSOLE
-    -------------------------------------------------------
-    Pocket/tablet companion UI for fleet command.
+    O-NET V1 | TABLET GLASS COCKPIT
+    ---------------------------------------------
+    Pocket-first UI for wireless tablet command.
 
-    NOTE: Pocket computers accept only one peripheral upgrade.
-    The wireless modem is mandatory, so geo scanner upload is
-    not supported on the tablet. Use a miner turtle to scan.
-
-    Features:
-      - Self-adapting terminal UI (resizes with tablet screen)
-      - Live fleet list with numeric selection (1..9, 0=10)
-      - Commands to overseer:
-          START / STOP / RECALL
-          COME_TO_ME / GOTO / GETME / TUNNEL_FROM
-
-    Controls:
-      1..9 / 0  select robot index
-      c         selected bot come to you (GPS required)
-      g         selected bot goto x y z
-      t         selected bot tunnel-from x y z dir(n/e/s/w)
-      m         getme <ore> <count>
-      a         start all
-      o         stop all
-      r         recall all
-      s         force sync now
-      q         quit
+    - One-upgrade pocket mode (wireless modem only)
+    - Compact, width-aware rendering for small screens
+    - Periodic GPS self-location refresh
+    - Fleet selection + command dispatch
 ]]
 
 local PROTOCOL = "ONET_V1"
 local TABLET_ID = string.format("TB-%04X", os.getComputerID() % 0xFFFF)
+
+local SYNC_INTERVAL_SEC = 1.5
+local GPS_REFRESH_SEC = 4
 
 local server_id = nil
 local fleet = {}
 local selected_index = 1
 local last_sync_ms = 0
 local last_msg = ""
+
+local self_pos = nil
+local last_gps_ms = 0
+local gps_ok = false
+
+local modem = peripheral.find("modem")
+if not modem then
+    error("No modem found. Attach wireless/ender modem.", 0)
+end
+rednet.open(peripheral.getName(modem))
 
 local function nowMs()
     return os.epoch("utc")
@@ -46,9 +41,7 @@ end
 
 local function splitWords(s)
     local t = {}
-    for w in tostring(s or ""):gmatch("%S+") do
-        t[#t + 1] = w
-    end
+    for w in tostring(s or ""):gmatch("%S+") do t[#t + 1] = w end
     return t
 end
 
@@ -57,11 +50,7 @@ local function parseCoords(parts, i)
     local y = tonumber(parts[i + 1])
     local z = tonumber(parts[i + 2])
     if x and y and z then
-        return {
-            x = math.floor(x),
-            y = math.floor(y),
-            z = math.floor(z),
-        }
+        return { x = math.floor(x), y = math.floor(y), z = math.floor(z) }
     end
     return nil
 end
@@ -75,11 +64,21 @@ local function parseDirToken(tok)
     return nil
 end
 
-local modem = peripheral.find("modem")
-if not modem then
-    error("No modem found. Attach wireless/ender modem.", 0)
+local function fit(s, w)
+    local text = tostring(s or "")
+    if #text > w then return text:sub(1, w) end
+    return text .. string.rep(" ", w - #text)
 end
-rednet.open(peripheral.getName(modem))
+
+local function shortId(hwid, maxLen)
+    local s = tostring(hwid or "?")
+    if #s <= maxLen then return s end
+    return s:sub(1, maxLen)
+end
+
+local function setMessage(s)
+    last_msg = tostring(s or "")
+end
 
 local function getGpsPos(timeout)
     if not gps or type(gps.locate) ~= "function" then return nil end
@@ -88,6 +87,18 @@ local function getGpsPos(timeout)
         return { x = math.floor(x), y = math.floor(y), z = math.floor(z) }
     end
     return nil
+end
+
+local function refreshSelfGps(timeout)
+    local p = getGpsPos(timeout or 1.5)
+    if p then
+        self_pos = p
+        last_gps_ms = nowMs()
+        gps_ok = true
+    else
+        gps_ok = false
+    end
+    os.queueEvent("tablet_refresh")
 end
 
 local function sendToOverseer(msg)
@@ -102,7 +113,7 @@ local function requestSync()
     sendToOverseer({
         type = "TABLET_SYNC_REQ",
         tablet = TABLET_ID,
-        pos = getGpsPos(1),
+        pos = self_pos,
     })
 end
 
@@ -128,90 +139,136 @@ local function selectedBot()
     return fleet[selected_index]
 end
 
-local function short(s, n)
-    local text = tostring(s or "")
-    if #text <= n then return text end
-    if n <= 3 then return text:sub(1, n) end
-    return text:sub(1, n - 3) .. "..."
-end
-
 local function prompt(label)
     local w, h = term.getSize()
     term.setCursorPos(1, h)
     term.clearLine()
-    write(label)
+    write(fit(label, w))
     local line = read()
     term.setCursorPos(1, h)
     term.clearLine()
     return trim(line)
 end
 
-local function setMessage(s)
-    last_msg = tostring(s or "")
+local function drawBand(y, text, fg, bg, w)
+    term.setCursorPos(1, y)
+    term.blit(fit(text, w), string.rep(fg, w), string.rep(bg, w))
+end
+
+local function statusCode(st)
+    local s = tostring(st or "?"):upper()
+    if s == "MINING" then return "MIN" end
+    if s == "STANDBY" then return "STB" end
+    if s == "PARKED" then return "PRK" end
+    if s == "RTB_DUMP" then return "RDP" end
+    if s == "RTB_FUEL" then return "RFL" end
+    if s == "FETCH_PICK" then return "FPK" end
+    if s == "GOTO" then return "GTO" end
+    return s:sub(1, 3)
+end
+
+local function cmdHint(w)
+    local phase = math.floor(nowMs() / 2200) % 3
+    if phase == 0 then
+        return fit("1-9/0 sel | c come | g goto", w)
+    elseif phase == 1 then
+        return fit("t tunnel | m getme | a/o/r all", w)
+    end
+    return fit("s sync | l gps | q quit", w)
 end
 
 local function drawUI()
     local w, h = term.getSize()
+    local cockpitBlue = "b"
+    local glassBg = "7"
+    local infoBg = "8"
+    local textLight = "f"
+    local textDark = "0"
+    local accent = "3"
+
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
     term.setCursorPos(1, 1)
     term.clear()
 
-    local conn = server_id and ("linked:" .. tostring(server_id)) or "searching"
-    local age = (last_sync_ms > 0) and math.floor((nowMs() - last_sync_ms) / 1000) or -1
+    local syncAge = (last_sync_ms > 0) and math.floor((nowMs() - last_sync_ms) / 1000) or -1
+    local linkTxt = server_id and ("OVR:" .. tostring(server_id)) or "OVR:--"
+    local top = string.format("ONET %s %s S:%s", TABLET_ID, linkTxt, (syncAge >= 0 and (syncAge .. "s") or "-"))
+    drawBand(1, top, textLight, cockpitBlue, w)
 
-    print(short("O-NET Tablet " .. TABLET_ID .. "  " .. conn, w))
-    print(short("Fleet:" .. #fleet .. "  Sync:" .. (age >= 0 and (age .. "s") or "-"), w))
-
-    local sel = selectedBot()
-    if sel then
-        print(short(string.format("Selected %d: %s  %s", selected_index, sel.hwid or "?", sel.status or "?"), w))
+    local gpsLine
+    if gps_ok and self_pos then
+        local gAge = math.floor((nowMs() - last_gps_ms) / 1000)
+        gpsLine = string.format("GPS FIX %d,%d,%d  %ds", self_pos.x, self_pos.y, self_pos.z, gAge)
     else
-        print(short("Selected: none", w))
+        gpsLine = "GPS NO FIX"
     end
+    drawBand(2, gpsLine, textDark, accent, w)
 
-    print(short("1..9/0 select | c come | g goto | t tunnel | m getme", w))
-    print(short("a start | o stop | r recall | s sync | q quit", w))
+    local b = selectedBot()
+    local selLine = "SEL: NONE"
+    if b then
+        local p = b.pos or { x = 0, y = 0, z = 0 }
+        local av = b.available and "Y" or "N"
+        selLine = string.format("SEL%d %s %s AV%s F%s", selected_index, shortId(b.hwid, 8), statusCode(b.status), av, tostring(b.fuel or "?"))
+        if w >= 24 then
+            selLine = string.format("SEL%d %s %s AV%s F%s @%d,%d,%d",
+                selected_index, shortId(b.hwid, 8), statusCode(b.status), av,
+                tostring(b.fuel or "?"), p.x or 0, p.y or 0, p.z or 0)
+        end
+    end
+    drawBand(3, selLine, textLight, infoBg, w)
 
-    local header = "#  HWID       ST        AV   FUEL  POS"
-    print(short(header, w))
+    drawBand(4, cmdHint(w), textLight, glassBg, w)
 
-    local rows_for_fleet = h - 8
-    if rows_for_fleet < 1 then rows_for_fleet = 1 end
+    term.setCursorPos(1, 5)
+    term.blit(string.rep("-", w), string.rep("8", w), string.rep("0", w))
+
+    local listTop = 6
+    local listBottom = h - 1
+    if listBottom < listTop then listBottom = listTop end
+    local rows = listBottom - listTop + 1
 
     local start_i = 1
-    if selected_index > rows_for_fleet then
-        start_i = selected_index - rows_for_fleet + 1
+    if selected_index > rows then
+        start_i = selected_index - rows + 1
     end
 
-    for row = 0, rows_for_fleet - 1 do
-        local i = start_i + row
-        local b = fleet[i]
-        if not b then
-            print("")
-        else
+    for r = 0, rows - 1 do
+        local y = listTop + r
+        local i = start_i + r
+        local bot = fleet[i]
+        if bot then
+            local p = bot.pos or { x = 0, y = 0, z = 0 }
             local mark = (i == selected_index) and ">" or " "
-            local av = b.available and "Y" or "N"
-            local p = b.pos or {}
-            local line = string.format("%s%2d %-10s %-8s  %s  %-5s (%d,%d,%d)",
-                mark, i,
-                tostring(b.hwid or "?"),
-                short(tostring(b.status or "?"), 8),
-                av,
-                short(tostring(b.fuel or "?"), 5),
-                tonumber(p.x) or 0,
-                tonumber(p.y) or 0,
-                tonumber(p.z) or 0)
-            print(short(line, w))
+            local av = bot.available and "Y" or "N"
+            local line
+            if w <= 22 then
+                line = string.format("%s%1d %s %s %s", mark, i % 10, shortId(bot.hwid, 6), statusCode(bot.status), av)
+            elseif w <= 28 then
+                line = string.format("%s%2d %-8s %s %s %d,%d", mark, i, shortId(bot.hwid, 8), statusCode(bot.status), av, p.x or 0, p.z or 0)
+            else
+                line = string.format("%s%2d %-10s %-3s %s F%-4s @%d,%d,%d",
+                    mark, i, shortId(bot.hwid, 10), statusCode(bot.status), av,
+                    tostring(bot.fuel or "?"), p.x or 0, p.y or 0, p.z or 0)
+            end
+            local fg = (i == selected_index) and string.rep("f", w) or string.rep("7", w)
+            local bg = (i == selected_index) and string.rep("4", w) or string.rep("0", w)
+            term.setCursorPos(1, y)
+            term.blit(fit(line, w), fg, bg)
+        else
+            term.setCursorPos(1, y)
+            term.blit(string.rep(" ", w), string.rep("0", w), string.rep("0", w))
         end
     end
 
     term.setCursorPos(1, h)
-    term.clearLine()
-    write(short(last_msg, w))
+    term.blit(fit(last_msg, w), string.rep("f", w), string.rep("8", w))
 end
 
 local function handleTabletAck(msg)
     if msg.ok then
-        setMessage("ACK " .. tostring(msg.action or "") .. (msg.hwid and (" -> " .. tostring(msg.hwid)) or ""))
+        setMessage("ACK " .. tostring(msg.action or "") .. (msg.hwid and ("->" .. tostring(msg.hwid)) or ""))
     else
         setMessage("NACK " .. tostring(msg.action or "") .. ": " .. tostring(msg.err or "?"))
     end
@@ -244,55 +301,55 @@ end
 local function syncThread()
     while true do
         requestSync()
-        sleep(1.5)
+        sleep(SYNC_INTERVAL_SEC)
+    end
+end
+
+local function gpsThread()
+    while true do
+        refreshSelfGps(1.5)
+        sleep(GPS_REFRESH_SEC)
     end
 end
 
 local function requireSelectedBot()
     local b = selectedBot()
     if not b then
-        setMessage("No bot selected.")
+        setMessage("No bot selected")
         return nil
     end
     if not b.available then
-        setMessage("Selected bot is not available right now.")
+        setMessage("Selected bot busy")
         return nil
     end
     return b
 end
 
 local function uiThread()
+    refreshSelfGps(2)
     requestSync()
-    setMessage("Waiting for overseer sync...")
+    setMessage("Cockpit online")
     drawUI()
 
     while true do
         local ev, p1 = os.pullEvent()
-
         if ev == "char" then
             local ch = tostring(p1)
 
             if ch:match("%d") then
-                if ch == "0" then
-                    selected_index = 10
-                else
-                    selected_index = tonumber(ch) or selected_index
-                end
+                if ch == "0" then selected_index = 10 else selected_index = tonumber(ch) or selected_index end
                 clampSelection()
                 local b = selectedBot()
-                if b then
-                    setMessage("Selected " .. tostring(b.hwid))
-                end
+                if b then setMessage("Selected " .. tostring(b.hwid)) end
 
             elseif ch == "c" then
                 local b = requireSelectedBot()
                 if b then
-                    local me = getGpsPos(2)
-                    if me then
-                        sendTabletCmd("COME_TO_ME", { hwid = b.hwid, pos = me })
-                        setMessage(string.format("COME_TO_ME -> %s (%d,%d,%d)", b.hwid, me.x, me.y, me.z))
+                    if self_pos then
+                        sendTabletCmd("COME_TO_ME", { hwid = b.hwid, pos = self_pos })
+                        setMessage(string.format("COME %s -> %d,%d,%d", b.hwid, self_pos.x, self_pos.y, self_pos.z))
                     else
-                        setMessage("GPS lock required for COME_TO_ME.")
+                        setMessage("GPS lock required")
                     end
                 end
 
@@ -304,24 +361,24 @@ local function uiThread()
                     local pos = parseCoords(parts, 1)
                     if pos then
                         sendTabletCmd("GOTO", { hwid = b.hwid, pos = pos })
-                        setMessage(string.format("GOTO -> %s (%d,%d,%d)", b.hwid, pos.x, pos.y, pos.z))
+                        setMessage(string.format("GOTO %s -> %d,%d,%d", b.hwid, pos.x, pos.y, pos.z))
                     else
-                        setMessage("Invalid coords. Use: x y z")
+                        setMessage("Bad coords")
                     end
                 end
 
             elseif ch == "t" then
                 local b = requireSelectedBot()
                 if b then
-                    local line = prompt("tunnel-from x y z dir(n/e/s/w): ")
+                    local line = prompt("tunnel x y z dir: ")
                     local parts = splitWords(line)
                     local pos = parseCoords(parts, 1)
                     local dir = parseDirToken(parts[4])
                     if pos and dir ~= nil then
                         sendTabletCmd("TUNNEL_FROM", { hwid = b.hwid, pos = pos, dir = dir })
-                        setMessage(string.format("TUNNEL_FROM -> %s (%d,%d,%d) dir=%d", b.hwid, pos.x, pos.y, pos.z, dir))
+                        setMessage(string.format("TUN %s -> %d,%d,%d d%d", b.hwid, pos.x, pos.y, pos.z, dir))
                     else
-                        setMessage("Invalid payload. Use: x y z dir")
+                        setMessage("Bad tunnel args")
                     end
                 end
 
@@ -334,29 +391,37 @@ local function uiThread()
                     sendTabletCmd("GETME", { ore = ore, count = count })
                     setMessage(string.format("GETME %s x%d", ore, count))
                 else
-                    setMessage("Invalid getme. Use: ore count")
+                    setMessage("Bad getme args")
                 end
 
             elseif ch == "a" then
                 sendTabletCmd("START", {})
-                setMessage("START broadcast.")
+                setMessage("START broadcast")
 
             elseif ch == "o" then
                 sendTabletCmd("STOP", {})
-                setMessage("STOP broadcast.")
+                setMessage("STOP broadcast")
 
             elseif ch == "r" then
                 sendTabletCmd("RECALL", {})
-                setMessage("RECALL broadcast.")
+                setMessage("RECALL broadcast")
 
             elseif ch == "s" then
                 requestSync()
-                setMessage("Sync requested.")
+                setMessage("Sync requested")
+
+            elseif ch == "l" then
+                refreshSelfGps(2)
+                if self_pos then
+                    setMessage(string.format("GPS %d,%d,%d", self_pos.x, self_pos.y, self_pos.z))
+                else
+                    setMessage("GPS no fix")
+                end
 
             elseif ch == "q" then
                 term.setCursorPos(1, 1)
                 term.clear()
-                print("Tablet console stopped.")
+                print("Tablet cockpit stopped.")
                 return
             end
 
@@ -369,4 +434,4 @@ local function uiThread()
     end
 end
 
-parallel.waitForAny(receiverThread, syncThread, uiThread)
+parallel.waitForAny(receiverThread, syncThread, gpsThread, uiThread)
