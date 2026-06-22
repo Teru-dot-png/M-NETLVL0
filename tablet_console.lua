@@ -150,6 +150,28 @@ local function prompt(label)
     return trim(line)
 end
 
+local function promptRequired(label)
+    while true do
+        local v = prompt(label)
+        if v == "" then
+            setMessage("Cancelled")
+            return nil
+        end
+        return v
+    end
+end
+
+local function promptInt(label)
+    local v = promptRequired(label)
+    if not v then return nil end
+    local n = tonumber(v)
+    if not n then
+        setMessage("Expected number")
+        return nil
+    end
+    return math.floor(n)
+end
+
 local function drawBand(y, text, fg, bg, w)
     term.setCursorPos(1, y)
     term.blit(fit(text, w), string.rep(fg, w), string.rep(bg, w))
@@ -356,42 +378,55 @@ local function uiThread()
             elseif ch == "g" then
                 local b = requireSelectedBot()
                 if b then
-                    local line = prompt("goto x y z: ")
-                    local parts = splitWords(line)
-                    local pos = parseCoords(parts, 1)
-                    if pos then
-                        sendTabletCmd("GOTO", { hwid = b.hwid, pos = pos })
-                        setMessage(string.format("GOTO %s -> %d,%d,%d", b.hwid, pos.x, pos.y, pos.z))
-                    else
-                        setMessage("Bad coords")
+                    local x = promptInt("goto x: ")
+                    if x ~= nil then
+                        local y = promptInt("goto y: ")
+                        if y ~= nil then
+                            local z = promptInt("goto z: ")
+                            if z ~= nil then
+                                local pos = { x = x, y = y, z = z }
+                                sendTabletCmd("GOTO", { hwid = b.hwid, pos = pos })
+                                setMessage(string.format("GOTO %s -> %d,%d,%d", b.hwid, pos.x, pos.y, pos.z))
+                            end
+                        end
                     end
                 end
 
             elseif ch == "t" then
                 local b = requireSelectedBot()
                 if b then
-                    local line = prompt("tunnel x y z dir: ")
-                    local parts = splitWords(line)
-                    local pos = parseCoords(parts, 1)
-                    local dir = parseDirToken(parts[4])
-                    if pos and dir ~= nil then
-                        sendTabletCmd("TUNNEL_FROM", { hwid = b.hwid, pos = pos, dir = dir })
-                        setMessage(string.format("TUN %s -> %d,%d,%d d%d", b.hwid, pos.x, pos.y, pos.z, dir))
-                    else
-                        setMessage("Bad tunnel args")
+                    local x = promptInt("tun x: ")
+                    if x ~= nil then
+                        local y = promptInt("tun y: ")
+                        if y ~= nil then
+                            local z = promptInt("tun z: ")
+                            if z ~= nil then
+                                local d = promptRequired("dir n/e/s/w: ")
+                                if d then
+                                    local dir = parseDirToken(d)
+                                    if dir ~= nil then
+                                        local pos = { x = x, y = y, z = z }
+                                        sendTabletCmd("TUNNEL_FROM", { hwid = b.hwid, pos = pos, dir = dir })
+                                        setMessage(string.format("TUN %s -> %d,%d,%d d%d", b.hwid, pos.x, pos.y, pos.z, dir))
+                                    else
+                                        setMessage("Bad dir")
+                                    end
+                                end
+                            end
+                        end
                     end
                 end
 
             elseif ch == "m" then
-                local line = prompt("getme ore count: ")
-                local parts = splitWords(line)
-                local ore = parts[1]
-                local count = tonumber(parts[2])
-                if ore and count and count > 0 then
-                    sendTabletCmd("GETME", { ore = ore, count = count })
-                    setMessage(string.format("GETME %s x%d", ore, count))
-                else
-                    setMessage("Bad getme args")
+                local ore = promptRequired("ore name: ")
+                if ore then
+                    local count = promptInt("ore count: ")
+                    if count and count > 0 then
+                        sendTabletCmd("GETME", { ore = ore, count = count })
+                        setMessage(string.format("GETME %s x%d", ore, count))
+                    elseif count then
+                        setMessage("Count must be > 0")
+                    end
                 end
 
             elseif ch == "a" then
