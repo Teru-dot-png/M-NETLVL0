@@ -1169,6 +1169,7 @@ end
 -- }
 -- ============================================================
 local active_orders = {}
+local countInDump
 
 local function startGetmeOrder(ore_name, target)
     ore_name = tostring(ore_name or "")
@@ -1387,7 +1388,7 @@ local function handleReserveRel(msg)
     end
 end
 
-local function countInDump(ore_name)
+function countInDump(ore_name)
     -- Count matching items already in the dump chest.
     -- The ore name may arrive as "diamond" (shortname) or
     -- "minecraft:diamond" (full). Match both.
