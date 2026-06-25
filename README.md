@@ -1,416 +1,289 @@
-# O-NET V1 Robot Mesh Network
+# O-NET V2 — Modular Turtle Swarm
 
-A deployable CC:Tweaked swarm mining system with:
+O-NET V2 is a deployable [CC:Tweaked](https://tweaked.cc/) swarm-mining system
+for ComputerCraft turtles. A single **overseer** computer commands a fleet of
+**mining turtles** that tunnel a shared grid, scan their surroundings, report
+ore and geometry, deconflict their movements, refuel and repair themselves, and
+— with a crafting turtle in the fleet — **self-replicate** to maintain a target
+population.
 
-- One overseer computer (`main_mapper.lua`) that manages the fleet, map, parking, orders, and collision brokering.
-- Many miner turtles (`scout_node.lua`) that mine lanes, scan geometry, report ore, and execute targeted ore jobs.
-- A mesh-like behavior model over Rednet with push/yield and tile reservation coordination.
+This is the **V2 modular refactor**. The entire system lives under
+[onet/](onet/) as small single-responsibility modules, replacing the old V1
+monolith. If you are looking for `main_mapper.lua`, `scout_node.lua`, or
+`tablet_console.lua` — those V1 files no longer exist; their behavior has been
+ported into the modules described below.
 
-This guide is written so someone can deploy their own network from scratch.
+---
 
-## 1) What You Get
+## 1) Two-Runtime Architecture
 
-- Fleet orchestration over `ONET_V1` protocol.
-- Automatic lane assignment and re-assignment (`newrun`).
-- Live monitor cockpit with map, fleet state, ore feed, and supplies.
-- Persistent map storage across overseer restarts (`mnet_map.dat`).
-- Ore target workflows:
-- Passive mining scan reports.
-- WANT-list detours (`want`, `unwant`).
-- Explicit order queue (`getme <ore> <count>`).
-- Multi-robot deconfliction:
-- Priority push protocol (`PUSH_REQ` / `YIELD`).
-- Overseer arbitration by state priority.
-- Tile reservation protocol (`RESERVE_REQ` / `RESERVE_ACK` / `RESERVE_REL`).
-- Miner survivability:
-- Stuck detection and bounded recovery.
-- Adaptive A* detours.
-- Inventory, fuel, and pickaxe recovery flows.
+O-NET runs as exactly two kinds of program, dispatched automatically by a single
+[startup.lua](startup.lua):
+
+```lua
+if turtle then
+    shell.run("/onet/boot_turtle.lua")
+else
+    shell.run("/onet/boot_overseer.lua")
+end
+```
+
+- **Overseer** — a stationary computer (advanced recommended, with a monitor).
+  Boots via [onet/boot_overseer.lua](onet/boot_overseer.lua). It owns the
+  authoritative map (voxel + grid), the fleet roster, order queue, push/
+  reservation arbitration, population control, and the operator cockpit.
+- **Turtle** — a mining turtle. Boots via
+  [onet/boot_turtle.lua](onet/boot_turtle.lua). It detects its own hardware,
+  calibrates heading from GPS, enlists with the overseer, and then runs three
+  pcall-supervised threads in parallel: the **brain** (role → task agent loop),
+  the **listener** (network), and the **heartbeat**.
+
+Both boot files install a flat `package.path` across the `/onet` tree and share
+[onet/config.lua](onet/config.lua) as the single source of truth for all
+constants.
+
+---
 
 ## 2) Repository Layout
 
-- `main_mapper.lua`: Overseer runtime.
-- `scout_node.lua`: Miner turtle runtime.
-- `tablet_console.lua`: Pocket/tablet command and scouting UI.
-- `README.md`: This deployment and operations guide.
+```
+startup.lua                 Entry point: dispatch to turtle or overseer boot
+README.md                   This file
+docs/                       Full documentation set (see docs/README.md)
 
-## 3) Software and Mod Requirements
+onet/
+  config.lua                Single source of truth for all tunable constants
+  boot_turtle.lua           Turtle boot + supervised brain/listener/heartbeat
+  boot_overseer.lua         Overseer boot + peripheral/GPS/persist setup
 
-Minimum practical stack:
+  lib/                      Shared, hardware-free libraries
+    vec.lua                 Vector / coordinate / direction helpers
+    grid.lua                Grid-coordinate math (segments, lanes, pillars)
+    blocks.lua              Block-name classification (ore/air/hazard/etc.)
+    proto.lua               Protocol message helpers / shared constants
+    log.lua                 Tagged logging
 
-- Minecraft with ComputerCraft: Tweaked (CC:Tweaked).
-- Ender modem support (from your pack setup).
-- Advanced Peripherals geo scanner support.
-- GPS availability in the mining dimension.
+  turtle/                   Turtle CORE runtime
+    brain.lua               Agent loop: hold a Role, drive one Task per tick
+    network.lua             Modem, AUTH handshake, listener thread, handlers
+    nav.lua                 Pathing (greedy + A* detours + recovery)
+    movers.lua              Primitive movement / facing / dig-step
+    scanner.lua             Geo-scanner hot-swap + ore reporting
+    calibrate.lua           GPS heading calibration (verified live)
+    cache.lua               Local block cache fed by scans
+    state.lua               Turtle runtime state (forward-declared globals)
+    hardware.lua            Peripheral + slot detection, scanner refresh
+    inventory.lua           Cargo management, slot-number tool protection
+    fuel.lua                Wake/refuel/forage logic
+    pickaxe.lua             Pickaxe equip / restore after scan swap
+    heartbeat.lua           Periodic status report thread
 
-Expected miner equipment behavior assumes:
+    roles/                  What a turtle is currently *for*
+      role_miner.lua        Grid mining (default role)
+      role_hauler.lua       Move cargo between zones / dump
+      role_scout.lua        Explore / search jobs
+      role_refuel.lua       Refuel-focused behavior
+      role_builder.lua      Build structures / smelt Genesis materials
+      role_genesis.lua      Self-replication (crafty turtle only)
 
-- Geo scanner item id: `advancedperipherals:geo_scanner`.
-- Pickaxe item matching: contains `pickaxe` in item name.
+    tasks/                  Atomic composable units of work (Overmind chain)
+      task.lua              Base Task object (.parent chaining, isWorking)
+      task_goto.lua         Navigate to a coordinate
+      task_mine.lua         Mine ore / a target block
+      task_tunnel.lua       Dig a straight segment of the grid
+      task_scan.lua         Geo scan + report
+      task_park.lua         Go to and hold a parking position
+      task_dump.lua         Deposit cargo into the dump/zone chest
+      task_fuel.lua         Return-to-base refuel
+      task_craft.lua        Arrange grid + single turtle.craft()
+      task_build.lua        Place blocks for a build job
 
-## 4) Physical Topology
+  overseer/                 Overseer runtime
+    overseer.lua            Main loop: run all overseer threads supervised
+    director.lua            Listener + roster pruner threads
+    cockpit.lua             Monitor cockpit rendering thread
+    terminal.lua            Operator command terminal thread
+    fleet.lua               Fleet roster model + per-turtle records
+    population.lua          Target-fleet enforcement + Genesis authorization
+    push_broker.lua         PUSH_REQ arbitration (who yields)
+    orders.lua              getme-style retrieval order queue + thread
+    zones.lua               Storage-zone (ORES/FUEL/...) chest assignment
+    park.lua                Parking-slot allocation
+    gridmap.lua             Grid origin + segment/lane assignment
+    voxelmap.lua            Authoritative voxel DB + air inference
+    persist.lua             Config + map load/save (and save thread)
+    state.lua               Overseer runtime state
+    boot_overseer.lua       (boot entry — see /onet/boot_overseer.lua)
+```
 
-### Overseer Computer
+A complete per-module documentation set lives under [docs/](docs/README.md).
 
-Attach:
+---
 
-- Ender modem (any side).
-- Advanced monitor (recommended for cockpit visibility).
-- Optional inventory/chest peripheral for supply readout and dump counting.
+## 3) Software & Mod Requirements
 
-Place near your base logistics.
+- **Minecraft + CC:Tweaked** — the ComputerCraft fork this codebase targets.
+- **Advanced Peripherals — Geo Scanner** — item id
+  `advancedperipherals:geo_scanner`. Each mining turtle carries one in its
+  reserved scanner slot and hot-swaps it onto the tool side to scan.
+- **Ender modem** on every turtle and on the overseer, for unbounded-range
+  Rednet under protocol `ONET_V2`.
+- **GPS constellation** covering the mining dimension. Turtles call
+  `gps.locate()` during calibration and verify heading live on restore; the
+  overseer derives its grid origin (and the base-protection center) from GPS at
+  boot. Without a stable GPS fix, navigation degrades and the overseer falls
+  back to a default origin.
+- A **diamond pickaxe** (`minecraft:diamond_pickaxe`) per mining turtle.
+- A **crafting turtle** ("crafty") in the fleet if you want self-replication;
+  only a crafty turtle exposes `turtle.craft` and can run the Genesis role.
 
-### Miner Turtles
+---
 
-Per miner:
+## 4) The Slot Reservation Contract (NON-NEGOTIABLE)
+
+Mining turtles use a fixed inventory layout, defined in
+[onet/config.lua](onet/config.lua):
+
+| Slot | Contents | Status |
+|------|----------|--------|
+| **1** | Geo scanner (`advancedperipherals:geo_scanner`) | **Reserved** |
+| **2** | Diamond pickaxe (`minecraft:diamond_pickaxe`) | **Reserved** |
+| **3–16** | Cargo (14 slots) | Free |
+
+Tool protection keys on these **slot numbers** *before* any `getItemDetail`
+call. This is deliberate: NBT/Forge-tagged tools can make `getItemDetail`
+return `nil`, which would trick a naive "is this a tool?" check into dumping the
+scanner or pickaxe. The scanner hot-swap additionally holds a `scanning_now`
+lock so the inventory/pickaxe logic cannot race the swap. **Do not** bypass the
+slot-number guard or remove the lock.
+
+---
+
+## 5) Deployment & Boot
+
+### 5.1 Install the tree
+
+Every computer in the system runs the **same** `/onet` tree plus `/startup.lua`.
+Copy both onto each device (overseer computer and each turtle). The startup
+script auto-detects the device type — there is no separate "miner script" vs
+"overseer script" to install.
+
+Place on each device:
+
+- `/startup.lua`
+- the entire `/onet/` directory
+
+Once Genesis is running, you do not need to install turtles by hand: a crafting
+turtle copies the whole `/onet` tree + `/startup.lua` onto each turtle it builds
+(see §6).
+
+### 5.2 Hardware setup
+
+**Overseer computer**
+
+- Ender modem (any side) — required.
+- Advanced monitor — recommended (drives the cockpit).
+- A chest peripheral ("vault") — optional, for supply readout.
+- Good GPS coverage at its location (defines the grid origin and base-protection
+  center).
+
+**Each mining turtle**
 
 - Ender modem on one side.
-- Pickaxe on opposite side (hot-swapped during scans).
-- Geo scanner in slot 1 (reserved).
-- Fuel in slots 2-15 (or supply path via BASE chest).
-
-### Chests and Coordinates
-
-- `DUMP_CHEST`: where ore payload is dropped.
-- `BASE_CHEST`: where emergency fuel and replacement pickaxe are sourced.
-- Optional parking rectangle (`setpark`) for orderly recall parking.
-
-## 5) GPS Requirement (Critical)
-
-Miners call `gps.locate()` during calibration and drift correction.
-
-If GPS is missing or unstable:
-
-- Miners cannot reliably calibrate heading.
-- Navigation quality drops severely.
-- Boot can fail with calibration fatal errors.
-
-Set up a robust GPS constellation in the active dimension before fleet rollout.
-
-## 6) First-Time Deployment
-
-## 6.1 Load Scripts
-
-Copy `main_mapper.lua` to the overseer computer.
-
-Copy `scout_node.lua` to every miner turtle.
-
-Copy `tablet_console.lua` to any pocket computer or tablet you want to use as a mobile controller.
-
-Fast install via wget:
-
-Overseer computer:
-
-```sh
-wget https://raw.githubusercontent.com/Teru-dot-png/M-NETLVL0/refs/heads/main/main_mapper.lua startup.lua
-```
-
-Miner turtle:
-
-```sh
-wget https://raw.githubusercontent.com/Teru-dot-png/M-NETLVL0/refs/heads/main/scout_node.lua startup.lua
-```
-
-Tablet / pocket computer:
-
-```sh
-wget https://raw.githubusercontent.com/Teru-dot-png/M-NETLVL0/refs/heads/main/tablet_console.lua tablet_console.lua
-```
-
-To auto-run the tablet UI on boot, create a `startup` file on the pocket computer:
-
-```sh
-edit startup
-```
-
-```lua
-shell.run("tablet_console.lua")
-```
-
-Recommended startup files:
-
-Overseer `startup`:
-
-```lua
-shell.run("main_mapper.lua")
-```
-
-Miner `startup`:
-
-```lua
-shell.run("scout_node.lua")
-```
-
-## 6.2 Boot Order
-
-1. Boot overseer first.
-2. Boot miners.
-3. Wait for miner `AUTH_REQ` / overseer `AUTH_ACK` enlistment.
-4. Set base coordinates and policy commands.
-5. Start fleet.
-
-## 6.3 Mandatory Initial Config
-
-On overseer terminal:
-
-1. `setdump x y z`
-2. `setbase x y z`
-3. Optional: `setpark x1 y1 z1 x2 y2 z2`
-4. Verify: `coords`
-5. Start operation: `start`
-
-## 6.4 Tablet Hardware Requirements
-
-The tablet console runs on a **CC:Tweaked Pocket Computer** (advanced recommended for color).
-
-> **Peripheral slot limit:** Pocket computers only accept **one** peripheral upgrade. The wireless modem is mandatory for network communication, so it occupies that slot. A geo scanner upgrade cannot be installed at the same time.
-
-Required:
-- **Wireless modem upgrade** installed in the pocket computer (takes the only upgrade slot).
-- GPS lock available at the player's position (needed for `come-to-me`).
-
-Geo scanner (`x` key):
-- Not available on the tablet due to the single-upgrade slot being taken by the modem.
-- Pressing `x` will report "No geo scanner peripheral found." and do nothing.
-- To scan an area manually, position a miner turtle there and trigger a scan from it instead.
-
-The tablet does **not** need to be near the overseer. It communicates over the wireless modem network as the miners do.
-
-## 7) Overseer Command Reference
-
-Core control:
-
-- `start`: deploy fleet into active mining behavior.
-- `stop`: halt mining progression.
-- `recall`: force return-home behavior (dump then park).
-- `status`: per-miner state, fuel, free slots, and position summary.
-
-Configuration:
-
-- `setdump x y z`: set dump chest coordinate.
-- `setbase x y z`: set base chest coordinate.
-- `setpark x1 y1 z1 x2 y2 z2`: set parking rectangle.
-- `coords`: print configured coordinates.
-
-Want-list:
-
-- `want <ore>`: add ore to auto-detour fetch list.
-- `unwant <ore>`: remove ore from auto-detour list.
-- `wants`: print active wants.
-
-Orders:
-
-- `getme <ore> <count>`: create/replace active retrieval order for ore.
-- `orders`: list active orders and progress.
-- `cancelorder <ore>`: cancel one ore order.
-
-Lane and map:
-
-- `zones`: show lane assignment and exhaustion state.
-- `newrun <hwid>`: assign a fresh lane to a parked/exhausted miner.
-- `map`: map stats.
-- `savemap`: force map persistence.
-- `clearmap`: wipe map state.
-- `feed`: recent ore feed events.
-- `help`: command list.
-
-## 7b) Tablet Console Reference
-
-The tablet console (`tablet_console.lua`) provides a live mobile cockpit and per-robot command interface.
-
-### How to launch
-
-Run on the pocket computer:
-
-```sh
-tablet_console
-```
-
-The UI auto-syncs with the overseer, refreshes the fleet list in real time, and adapts to the tablet's terminal dimensions.
-
-### Layout
-
-```
-O-NET Tablet TB-xxxx  linked:<id>
-Fleet:3  Scanner:yes  Sync:1s
-Selected 2: MN-000F  MINING
-1..9/0 select | c come | g goto | t tunnel | m getme
-a start | o stop | r recall | x scan | s sync | q quit
-#  HWID       ST        AV   FUEL  POS
-   1 MN-0014   PARKED    Y  500   (147,0,-314)
->  2 MN-000F   MINING    Y  412   (139,1,-316)
-   3 MN-...    RTB_DUMP  N  80    (141,1,-314)
-```
-
-- `>` marks the currently selected bot.
-- `AV` column shows `Y` (available) or `N` (busy/unavailable) for commands.
-- The list scrolls automatically to keep the selection visible.
-
-### Key Bindings
-
-| Key | Action |
-|-----|--------|
-| `1`..`9` | Select bot by position in fleet list |
-| `0` | Select bot #10 |
-| `c` | Send selected bot **COME TO ME** (uses your GPS position) |
-| `g` | Send selected bot to a **GOTO** coordinate (prompts for `x y z`) |
-| `t` | Send selected bot a **TUNNEL FROM** command (prompts for `x y z dir`) |
-| `m` | Issue a **GETME** order (prompts for `ore count`) |
-| `a` | **Start** all miners |
-| `o` | **Stop** all miners (halt in place) |
-| `r` | **Recall** all miners (dump and park) |
-| `x` | ~~Geo scan upload~~ (not available — modem occupies the only upgrade slot) |
-| `s` | Force an immediate fleet **sync** |
-| `q` | Quit tablet console |
-
-### Command details
-
-**COME TO ME** (`c`)
-
-Requires GPS lock. Sends the selected bot a GOTO job pointing at your current player position. Useful for retrieving a specific robot or having it meet you in the field.
-
-**GOTO** (`g`)
-
-Prompts for `x y z`. Sends the selected bot directly to those absolute world coordinates as a GOTO job.
-
-**TUNNEL FROM** (`t`)
-
-Prompts for `x y z dir`. Sends the selected bot to the given position, then starts it tunneling in the given cardinal direction.
-
-- Direction accepts: `n`, `north`, `0` → North; `e`, `east`, `1` → East; `s`, `south`, `2` → South; `w`, `west`, `3` → West.
-- Example input: `139 1 -320 n`
-
-The bot navigates to the start position, faces the direction, and begins mining its own tunnel from that point.
-
-**GETME** (`m`)
-
-Prompts for `ore count`. Creates or replaces a retrieval order on the overseer.
-
-- Example input: `diamond 64`
-- Same behavior as typing `getme diamond 64` on the overseer terminal.
-
-**Geo scan upload** (`x`)
-
-Not usable on a standard wireless tablet. Pocket computers accept only one peripheral upgrade, and the wireless modem must occupy it. Pressing `x` will display an error and do nothing. To scan an area manually, position a miner turtle there instead.
-
-## 8) How Mining and Retrieval Actually Works
-
-Normal mining:
-
-- Miner tunnels its assigned lane.
-- Scans environment periodically and reports ore + geometry.
-- Overseer ingests map and ore feed.
-
-Want-list behavior:
-
-- If reported ore matches WANT list, overseer can dispatch nearest idle turtle to ore cluster.
-
-`getme` behavior:
-
-- Overseer starts an active order for target ore count.
-- Dispatch uses known map ore locations first.
-- If no known locations exist, order waits while normal mining discovers new nodes.
-- Completion tracks both mined confirmations and dump chest counts.
-
-## 9) Navigation and Collision Model
-
-Miner navigation combines:
-
-- Greedy axis movement for cheap progress.
-- A* local detours when blocked.
-- Recovery spiral + climb-over if A* fails.
-- Waypoint splitting for long routes.
-
-Deconfliction layers:
-
-- Priority push protocol for stuck robots.
-- Overseer push broker decides who should yield.
-- Reservation protocol prevents simultaneous tile entry intent.
-- Short-term anti-oscillation penalties reduce ping-pong loops.
-
-Priority policy (lower is more urgent):
-
-- `GOTO=1`, `RTB_FUEL=2`, `RTB_DUMP=3`, `FETCH_PICK=4`, `MINING=5`, `STANDBY=8`, `PARKED=9`.
-
-## 10) Protocol Summary (`ONET_V1`)
-
-Common miner -> overseer:
-
-- `AUTH_REQ`: miner enrollment request.
-- `HEARTBEAT`: state/fuel/position/free slot updates.
-- `ORE_REPORT`: ore discovery report.
-- `GEO_DATA`: geometry snapshots for map.
-- `ORE_MINED`: confirmed ore extraction.
-- `ALERT`: runtime warnings/failures.
-- `PUSH_REQ`: collision mediation request.
-- `RESERVE_REQ`: reserve tile intent.
-- `RESERVE_REL`: release tile reservation.
-
-Common overseer -> miner:
-
-- `AUTH_ACK`: enrollment response + config.
-- `CONFIG`: runtime config updates (dump/base/want/park/lane).
-- `CMD_START`, `CMD_STOP`, `CMD_RECALL`: fleet controls.
-- `GOTO`: targeted ore job.
-- `YIELD`: move-aside command during push arbitration.
-- `RESERVE_ACK`: reservation result.
-
-## 11) Map Rendering Model
-
-Map center tracks fleet centroid and current Y.
-
-Current render intent:
-
-- Unknown/rock defaults to `#`.
-- Known tunnel air renders as blank.
-- Ores render as ore glyphs.
-- Special markers:
-- `@` robot.
-- `D` dump.
-- `B` base.
-
-## 12) Operational Playbook
-
-Typical production loop:
-
-1. Start fleet.
-2. Watch `status`, `feed`, and monitor map.
-3. Add/remove wants as market or base needs change.
-4. Use `getme` for hard quotas.
-5. Use `newrun <hwid>` to recycle exhausted lanes.
-6. Use `recall` before maintenance windows.
-
-Recommended base policy:
-
-- Keep base chest stocked with coal and fresh pickaxes.
-- Keep dump chest capacity high to avoid chest-full parking.
-- Keep GPS and rednet coverage stable in all work regions.
-
-## 13) Tuning Knobs
-
-In `scout_node.lua`:
-
-- `SCAN_RADIUS`: scan volume.
-- `SCAN_EVERY`: cadence scan frequency.
-- `HEARTBEAT_INT`: heartbeat interval.
-- `FUEL_*`: fuel behavior thresholds.
-- `MAX_TUNNEL`: lane depth per run.
-- `STUCK_VALUE`: stuck threshold sensitivity.
-- `REPATH_PROB`: GPS sync probability.
-- `RESERVE_TTL_MS`, `RESERVE_WAIT_MS`: reservation timing.
-- `RECENT_TILE_WINDOW`: anti-oscillation memory window.
-
-In `main_mapper.lua`:
-
-- `HB_TIMEOUT`: lost-miner timeout.
-- `LANE_SPACING`: lane separation.
-- `WANT_LIST`: default policy.
-
-## 14) Troubleshooting
+- Diamond pickaxe on the opposite (tool) side — hot-swapped during scans.
+- Geo scanner in **slot 1**, diamond pickaxe in **slot 2** (see §4).
+- Fuel and cargo space in slots 3–16.
+
+### 5.3 Boot order
+
+1. Boot the **overseer** first so it can answer enlistment.
+2. Boot the **turtles**. Each broadcasts `AUTH_REQ`; the overseer replies
+   `AUTH_ACK` with the turtle's role, direction, dump/base, and zone chests.
+3. Configure dump/base/parking and storage zones from the overseer terminal.
+4. Start the fleet.
+
+The overseer terminal (`help` lists commands) drives day-to-day operation;
+populate dump/base coordinates and zones before starting mining.
+
+---
+
+## 6) Self-Replication (Genesis) — High Level
+
+O-NET can grow and heal its own fleet up to a hard cap defined by
+`TARGET_FLEET` in [onet/config.lua](onet/config.lua):
+
+- The overseer's **population controller** tracks live turtles. A turtle that
+  goes silent past `LOSS_TIMEOUT` is declared dead.
+- Population enforcement is **replace-on-loss only**: the fleet never exceeds
+  `TARGET_FLEET`, and Genesis never consumes the **last** turtle base — the
+  system cannot replicate itself out of existence.
+- When the live count is below target, the overseer authorizes a **crafty**
+  turtle (Genesis role) to craft a new turtle. The Builder/Genesis pipeline
+  gathers and smelts the raw materials in `GENESIS_RECIPE` into the
+  `GENESIS_MAT` storage zone; **`role_genesis` arranges the 3×3 crafting grid**
+  from those materials, then `task_craft` performs the single `turtle.craft()`,
+  places the new turtle, and signals `CRAFT_DONE`.
+- The newly built turtle receives the **entire `/onet` tree + `/startup.lua`**,
+  so on first power-on it runs the identical dispatch and enlists like any other
+  turtle.
+
+The one manual input the recipe calls for is an **ender eye** (for the advanced
+ender modem required for self-replication); everything else is gathered by the
+fleet.
+
+---
+
+## 7) Documentation
+
+Detailed, per-module documentation lives under [docs/](docs/README.md):
+
+- [docs/README.md](docs/README.md) — documentation index; one entry per source
+  module, mirroring the source tree.
+- [docs/architecture.md](docs/architecture.md) — system-level overview: the
+  overseer/turtle split, the Task-chain (Overmind) model, role → task →
+  nav/movers layering, network/protocol flow, push-broker + reservation
+  coordination, scanner hot-swap, ore clustering, voxel inference, and the
+  self-replication lifecycle.
+
+---
+
+## 8) Key Invariants (read before editing source)
+
+These contracts are enforced across the codebase and are easy to break by
+accident:
+
+- **`PROTOCOL = "ONET_V2"`** for every Rednet message.
+- **Slot-number tool protection** before `getItemDetail` (see §4).
+- **≤ 200 locals per scope**, with forward declarations where needed (a Lua VM
+  limit the modules are structured around).
+- **pcall-wrapped supervised threads** on both runtimes — a transient crash logs
+  and restarts rather than dropping to the shell or taking the base offline.
+- **GPS heading verified live on restore**, not trusted blindly from disk.
+- **`TARGET_FLEET` hard cap**, replace-on-loss only; never consume the last
+  turtle base.
+- **`GRID_SPACING`** (config.lua) sets lane separation — one 1-wide tunnel
+  every N blocks, leaving the pillars between lanes.
+- **`HB_TIMEOUT`** (config.lua) is the overseer's roster-prune timeout: a turtle
+  silent past it is dropped from the live roster.
+
+A few names that look like constants are actually **runtime state fields**, not
+`config.lua` values:
+
+- `RECENT_TILE_WINDOW` and `recent_tiles` — anti-oscillation memory window, in
+  [onet/turtle/state.lua](onet/turtle/state.lua).
+- `WANT_LIST` — the operator's retrieval policy (which ores to fetch), held in
+  [onet/turtle/state.lua](onet/turtle/state.lua) and
+  [onet/overseer/state.lua](onet/overseer/state.lua) and edited from the
+  overseer terminal (`want`/`unwant`/`wants`).
+
+For the full, authoritative list of every constant and contract, see
+[docs/config.md](docs/config.md).
+
+## 9) Troubleshooting
 
 Miners do not enlist:
 
-- Verify both sides have active modems and same protocol (`ONET_V1`).
+- Verify both sides have active modems and the same protocol (`ONET_V2`).
 - Boot overseer before miners.
 - Ensure rednet is open and not blocked by world chunk behavior.
 
@@ -422,8 +295,8 @@ Miners fail calibration:
 Miners loop around blocks:
 
 - Confirm reservation and push traffic is flowing.
-- Increase reservation TTL slightly if network lag is high.
-- Increase anti-oscillation window if ping-pong appears.
+- Increase reservation TTL slightly (`RESERVE_TTL_MS`) if network lag is high.
+- Increase the anti-oscillation window if ping-pong appears.
 
 No ore retrieval after `getme`:
 
@@ -449,7 +322,7 @@ Pickaxe fetch failures:
 - Keep spare fresh pickaxes available.
 - Verify base chest coordinate and chunk load.
 
-## 15) Safety and Hardening Notes
+## 10) Safety and Hardening Notes
 
 - Slot 1 is scanner-reserved by policy. Do not repurpose.
 - Avoid disabling GPS in active mining dimensions.
@@ -457,19 +330,18 @@ Pickaxe fetch failures:
 - Use parking zones to prevent base area traffic jams.
 - Use `recall` before editing scripts live.
 
-## 16) Updating the Network
+## 11) Updating the Network
 
 Safe update sequence:
 
-1. `recall` fleet (from overseer terminal or tablet `r`).
+1. `recall` the fleet from the overseer terminal.
 2. Wait until miners park/dump.
-3. Update scripts on overseer, miners, and tablet.
-4. Reboot overseer, then miners.
-5. Relaunch tablet console if open.
-6. Verify `status`, `coords`, and `wants`.
-7. `start` (or tablet `a`).
+3. Update the `/onet` tree (and `/startup.lua`) on the overseer and every turtle.
+4. Reboot the overseer, then the turtles.
+5. Verify `status`, `coords`, and `wants`.
+6. `start`.
 
-## 17) Minimal Quickstart Checklist
+## 12) Minimal Quickstart Checklist
 
 - GPS working in target dimension.
 - Overseer has modem and monitor.
@@ -477,9 +349,8 @@ Safe update sequence:
 - `setdump`, `setbase`, optional `setpark` configured.
 - `start` executed.
 - `status` shows fleet heartbeats.
-- (Optional) Tablet: pocket computer with wireless modem upgrade running `tablet_console.lua`.
 
-## 18) License and Customization
+## 13) License and Customization
 
 This repository is intended as a practical operations codebase.
 
